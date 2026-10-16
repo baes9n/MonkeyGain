@@ -2,11 +2,14 @@
 
 **MonkeyGain** is a lightweight, native GTK 4 desktop application for scanning music with [rsgain](https://github.com/complexlogic/rsgain). Inspired by the simplicity of elementary OS, it offers a clean interface, an expandable album library, and real ReplayGain analysis results without re-encoding audio.
 
-**Current version: 0.2.0 — early preview.** The Python core is covered by automated tests. The GTK UI should be tested on an actual Linux desktop before relying on it for valuable music. **Back up your files before enabling tag writing.**
+**Current version: 0.3.0 — early preview.** The Python core is covered by automated tests. The GTK UI should be tested on an actual Linux desktop before relying on it for valuable music. **Back up your files before enabling tag writing.**
 
 ## Features
 
 - Native GTK 4 layout with **Dark**, **Light**, and **System** appearance modes.
+- Drag and drop audio files or folders into the window, or open supported files via the desktop launcher.
+- Remembers the most recently imported folder for subsequent file dialogs.
+- Optional desktop notification when each scan queue finishes.
 - Import individual songs or entire directories, including recursively discovered albums.
 - **Expandable album cards** with track names and formats.
 - **Per-track results**: measured loudness (LUFS), calculated Track Gain (dB), and peak (dB).
@@ -52,9 +55,40 @@ python3 run.py
 
 A VS Code launch configuration is included in `.vscode/launch.json` for debugging with F5.
 
+## Install as a desktop application (without sudo)
+
+Keep the Git checkout in its desired location (for example, `/data/Projects/MonkeyGain`) and run:
+
+```bash
+cd /data/Projects/MonkeyGain
+python3 scripts/install_local.py
+```
+
+The installer creates three files in your **user account**:
+
+- `~/.local/bin/monkeygain` — a tiny launcher that points to the existing `run.py`.
+- `~/.local/share/applications/io.github.baes9n.MonkeyGain.desktop` — the application menu entry.
+- `~/.local/share/icons/hicolor/scalable/apps/io.github.baes9n.MonkeyGain.svg` — the MonkeyGain icon.
+
+No system files are changed and no project files are moved. You can still develop in VS Code and push changes to GitHub normally. **If you move or rename the project folder, run the installer again** so the launcher points to the new path. If the launcher has not appeared in the application menu, try logging out and back in.
+
+To run the installed launcher from a terminal:
+
+```bash
+~/.local/bin/monkeygain
+```
+
+To uninstall the desktop integration, while keeping the source, Git history and preferences:
+
+```bash
+python3 scripts/install_local.py --uninstall
+```
+
+This is a **local source-based installation**, not yet a standalone `.deb` or Flatpak package. It still relies on Python, GTK 4 and rsgain installed on your computer. It does not require administrator privileges.
+
 ## How to use MonkeyGain
 
-1. Choose **Add Folder** or **Add Files**. Folders are scanned recursively.
+1. Choose **Add Folder** or **Add Files**, or drag audio files and folders onto the application window. Folders are scanned recursively.
 2. Expand an album with the arrow on the left to see the files queued for that album.
 3. Review the **Settings** panel; the default profile matches:
 
@@ -66,7 +100,8 @@ A VS Code launch configuration is included in `.vscode/launch.json` for debuggin
 4. For a first test, **turn off Write Tags**. The resulting scan uses `--tagmode=s` and does not modify metadata.
 5. Click **Start Scan**. If Write Tags is enabled, confirm the metadata change dialog.
 6. Check **Album Gain**, **Loudness**, and **Album Peak** in the expanded album summary, and each track's **Loudness**, **Gain**, and **Peak** in the rows below it.
-7. Use **Export** to save the full analysis log.
+7. Use **Export** to save the full analysis log. If enabled, a desktop notification announces scan completion.
+8. MonkeyGain remembers the last imported directory and uses it as the initial location in future import dialogs.
 
 ### Understanding the results
 
@@ -119,13 +154,17 @@ The test suite covers recursive multiformat discovery, per-folder job creation, 
 MonkeyGain/
 ├── monkeygain/
 │   ├── __init__.py
-│   ├── app.py                 # GTK 4 application and expandable library
+│   ├── app.py                 # GTK 4 application, drag and drop, library
+│   ├── desktop.py             # Safe per-user desktop integration
 │   └── core.py                # Discovery, rsgain invocation, TSV parser
+├── scripts/
+│   └── install_local.py        # User-level installation and removal
 ├── assets/
 │   ├── monkeygain.svg        # App icon
 │   └── style.css             # Light/dark appearance and album cards
 ├── tests/
 │   ├── test_core.py
+│   ├── test_desktop.py
 │   └── test_results.py
 ├── .vscode/
 ├── CHANGELOG.md
@@ -144,7 +183,7 @@ cd /data/Projects/MonkeyGain
 python3 -m unittest discover -s tests -v
 git status
 git add .
-git commit -m "Release MonkeyGain v0.2.0: expandable library and structured results"
+git commit -m "Release MonkeyGain v0.3.0: desktop integration and drag and drop"
 git push origin main
 ```
 
@@ -152,9 +191,9 @@ The repository README, comments, interface messages, contributing guide, and cha
 
 ## Roadmap
 
-- Drag-and-drop importing and more responsive layouts on narrow windows.
+- Improved layouts for narrow windows and keyboard accessibility.
 - Optional metadata-based album grouping for multidisc releases.
-- Persistent scan history, result export to CSV, and an installer / Flatpak build.
+- Persistent scan history, result export to CSV, and independently packaged `.deb` / Flatpak builds.
 - Detailed validation of the ReplayGain tags after writing, including special Opus conventions.
 - Dynamic file format detection based on the installed rsgain version.
 

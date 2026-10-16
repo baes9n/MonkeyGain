@@ -11,6 +11,7 @@ gi.require_version('Gtk', '4.0')
 from gi.repository import Gio, GLib, Gtk, Gdk, Pango
 
 from . import __version__
+from .desktop import APP_ID
 from .core import (
     ScanRunner, ScanSettings, ScanMetric, probe_backend, discover_audio,
     make_album_jobs,
@@ -92,6 +93,8 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             'skip_existing': self.skip_switch.get_active(),
             'theme': ('system', 'light', 'dark')[self.theme_choice.get_selected()],
             'backend_path': self.backend_entry.get_text().strip(),
+            'last_folder': self._settings.get('last_folder', ''),
+            'notifications': self.notify_switch.get_active(),
         }
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -109,6 +112,14 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
     def _create_widgets(self):
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.set_child(root)
+        # Accept files and folders dropped anywhere on the main window.
+        self._drop_target = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        self._drop_target.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        self._drop_target.connect('enter', self._drop_enter)
+        self._drop_target.connect('leave', self._drop_leave)
+        self._drop_target.connect('drop', self._on_drop)
+        root.add_controller(self._drop_target)
+        self._drop_surface = root
 
         header = Gtk.HeaderBar()
         header.add_css_class('mg-header')
@@ -230,6 +241,9 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self.theme_choice.set_selected({'system': 0, 'light': 1, 'dark': 2}.get(
             self._settings.get('theme', 'dark'), 2))
         sidebar.append(self._plain_field('Appearance', self.theme_choice))
+        self.notify_switch = self._switch('Desktop Notifications',
+                                          'Notify when a scan finishes',
+                                          bool(self._settings.get('notifications', True)), sidebar)
         sidebar.append(Gtk.Separator())
         sidebar.append(label('rsgain Executable', 'mg-field-label'))
         self.backend_entry = Gtk.Entry()
@@ -250,6 +264,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             control.connect('notify::active', self._save_settings)
         self.clip_choice.connect('notify::selected', self._save_settings)
         self.theme_choice.connect('notify::selected', self._theme_changed)
+        self.notify_switch.connect('notify::active', self._save_settings)
         self.backend_entry.connect('changed', self._save_settings)
 
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
@@ -290,7 +305,8 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         icon.add_css_class('mg-muted')
         block.append(icon)
         block.append(label('Your music starts here', 'mg-section', xalign=0.5))
-        block.append(label('Choose Add Files or Add Folder to create a scan queue.', 'mg-description', xalign=0.5))
+        block.append(label('Drop audio files or folders here, or use Add Files / Add Folder.',
+                           'mg-description', xalign=0.5))
         return block
 
     def _plain_field(self, title: str, widget: Gtk.Widget) -> Gtk.Box:
@@ -381,9 +397,46 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         except GLib.Error:
             return
 
-    def _choose_files(self, *_args):
+    def _new_file_dialog(self, title: str) -> Gtk.FileDialog:
         dialog = Gtk.FileDialog()
-        dialog.set_title('Select Audio Files')
+        dialog.set_title(title)
+        remembered = Path(self._settings.get('last_folder') or Path.home()).expanduser()
+        if remembered.is_dir():
+            dialog.set_initial_folder(Gio.File.new_for_path(str(remembered)))
+        return dialog
+
+    def _remember_folder(self, paths: list[str]) -> None:
+        for raw in paths:
+            path = Path(raw).expanduser()
+            folder = path if path.is_dir() else path.parent
+            if folder.is_dir():
+                self._settings['last_folder'] = str(folder.resolve())
+                self._save_settings()
+                return
+
+    def _drop_enter(self, _target, _x, _y):
+        if self._busy or self._runner.running:
+            return Gdk.DragAction(0)
+        self._drop_surface.add_css_class('mg-drop-active')
+        return Gdk.DragAction.COPY
+
+    def _drop_leave(self, *_args):
+        self._drop_surface.remove_css_class('mg-drop-active')
+
+    def _on_drop(self, _target, value, _x, _y):
+        self._drop_leave()
+        if self._busy or self._runner.running or not isinstance(value, Gdk.FileList):
+            return False
+        paths = [file.get_path() for file in value.get_files()]
+        local_paths = [path for path in paths if path]
+        if not local_paths:
+            self._append_log('Only local files and folders can be imported.\n')
+            return False
+        self._discover(local_paths)
+        return True
+
+    def _choose_files(self, *_args):
+        dialog = self._new_file_dialog('Select Audio Files')
         dialog.open_multiple(self, None, self._on_files_selected)
 
     def _on_files_selected(self, dialog, result):
@@ -397,8 +450,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self._discover(files)
 
     def _choose_folder(self, *_args):
-        dialog = Gtk.FileDialog()
-        dialog.set_title('Select Music Folder')
+        dialog = self._new_file_dialog('Select Music Folder')
         dialog.select_folder(self, None, self._on_folder_selected)
 
     def _on_folder_selected(self, dialog, result):
@@ -418,6 +470,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             return
         self._busy = True
         self._set_import_sensitive(False)
+        self._remember_folder(paths)
         self.status_label.set_text('Searching for supported audio files…')
 
         def task():
@@ -699,7 +752,8 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self._set_import_sensitive(False)
         self.config_box.set_sensitive(False)
         for control in (self.album_switch, self.true_peak_switch, self.write_switch, self.skip_switch,
-                        self.theme_choice, self.clip_choice, self.backend_entry, self.backend_row):
+                        self.theme_choice, self.notify_switch, self.clip_choice,
+                        self.backend_entry, self.backend_row):
             control.set_sensitive(False)
         self.status_label.set_text('Starting scan…')
         try:
@@ -741,7 +795,8 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
     def _on_finished(self, success: int, errors: int, cancelled: bool):
         self.config_box.set_sensitive(True)
         for control in (self.album_switch, self.true_peak_switch, self.write_switch, self.skip_switch,
-                        self.theme_choice, self.clip_choice, self.backend_entry, self.backend_row):
+                        self.theme_choice, self.notify_switch, self.clip_choice,
+                        self.backend_entry, self.backend_row):
             control.set_sensitive(True)
         self._set_import_sensitive(True)
         self.cancel_button.set_sensitive(False)
@@ -757,6 +812,14 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             self.progress.set_text('Scan finished')
         self.status_label.set_text(message)
         self._append_log(f'\n{message}\n')
+        if self.notify_switch.get_active():
+            try:
+                notice = Gio.Notification.new('MonkeyGain scan finished' if not cancelled
+                                              else 'MonkeyGain scan cancelled')
+                notice.set_body(message)
+                self.get_application().send_notification('scan-finished', notice)
+            except GLib.Error as exc:
+                self._append_log(f'Notification unavailable: {exc}\n')
         return GLib.SOURCE_REMOVE
 
     def _cancel(self, *_args):
@@ -800,14 +863,20 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
 
 class MonkeyGain(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id='io.github.monkeygain.MonkeyGain',
-                         flags=Gio.ApplicationFlags.FLAGS_NONE)
+        super().__init__(application_id=APP_ID,
+                         flags=Gio.ApplicationFlags.HANDLES_OPEN)
 
     def do_activate(self):
         window = self.props.active_window
         if not window:
             window = MonkeyGainWindow(self)
         window.present()
+
+    def do_open(self, files, n_files, hint):
+        self.do_activate()
+        window = self.props.active_window
+        if window:
+            window._discover([f.get_path() for f in files if f.get_path()])
 
 
 def main() -> int:

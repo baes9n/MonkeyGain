@@ -57,3 +57,7 @@ window.mg-light { background-color: #f5f7fa; color: #202633; }
 .mg-track-format { font-size: 10px; opacity: .6; }
 .mg-track-value { font-size: 11px; font-feature-settings: 'tnum'; }
 .mg-adjusted { color: #d5a45e; }
+
+/* 0.3.0: highlight the library when importing via drag and drop. */
+.mg-drop-active .mg-card { border: 2px dashed #8499ff; }
+.mg-drop-active .mg-album-list { background-color: alpha(#8499ff, 0.07); }

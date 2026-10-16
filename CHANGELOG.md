@@ -2,6 +2,21 @@
 
 All notable changes to MonkeyGain are documented here. Versions follow the `MAJOR.MINOR.PATCH` convention.
 
+## [0.3.0] — 2026-10-16
+
+### Added
+- Drag-and-drop import for local files and folders using GTK 4's native file drop target.
+- A per-user application-menu installer (`python3 scripts/install_local.py`) with an icon, desktop entry, and launcher.
+- Reversible desktop integration (`--uninstall`) that preserves Git history, source files, and preferences.
+- Support for opening audio files supplied to the desktop launcher.
+- Optional desktop notifications on scan completion or cancellation.
+- Recently used folder persistence for GTK file selection dialogs.
+- Installation tests for paths containing spaces and reversible per-user installation.
+
+### Changed
+- Application ID aligned with the GitHub namespace: `io.github.baes9n.MonkeyGain`.
+- The README and all new interface messages remain in English.
+
 ## [0.2.0] — 2026-10-16
 
 ### Added

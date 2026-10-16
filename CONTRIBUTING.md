@@ -28,3 +28,7 @@ Include your distribution, Python / GTK / rsgain versions, steps to reproduce, a
 ## Scope and roadmap
 
 See [README.md](README.md) for existing functionality and planned enhancements. Keep changes focused and explain any changes to backend command-line flags.
+
+### Desktop integration checks
+
+On a Linux desktop with GTK 4, verify drag and drop, file opening from the application menu, and notifications. Use `python3 scripts/install_local.py` to install and `python3 scripts/install_local.py --uninstall` to remove the user-level launcher. Automated unit tests cannot replace manual desktop testing.
