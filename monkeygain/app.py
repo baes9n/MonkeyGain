@@ -8,11 +8,11 @@ import threading
 
 import gi
 gi.require_version('Gtk', '4.0')
-from gi.repository import Gio, GLib, Gtk, Gdk
+from gi.repository import Gio, GLib, Gtk, Gdk, Pango
 
 from . import __version__
 from .core import (
-    ScanRunner, ScanSettings, backend_version, discover_audio,
+    ScanRunner, ScanSettings, ScanMetric, probe_backend, discover_audio,
     make_album_jobs,
 )
 
@@ -49,32 +49,29 @@ def button(text: str, icon: str, callback, css: str = '') -> Gtk.Button:
 class MonkeyGainWindow(Gtk.ApplicationWindow):
     def __init__(self, application: Gtk.Application):
         super().__init__(application=application, title='MonkeyGain')
-        self.set_default_size(1120, 740)
+        self.set_default_size(1180, 780)
         self.set_size_request(800, 580)
         self._files: set[Path] = set()
-        self._rows: list[tuple[Gtk.Label, Gtk.Image]] = []
+        self._rows: list[dict] = []
+        self._results: dict[Path, dict] = {}
         self._jobs = []
         self._busy = False
         self._settings = self._read_settings()
+        self.backend = probe_backend(self._settings.get('backend_path', ''))
         self._runner = ScanRunner(
             lambda line: GLib.idle_add(self._append_log, line),
             lambda idx, status: GLib.idle_add(self._on_job, idx, status),
             lambda ok, err, canceled: GLib.idle_add(self._on_finished, ok, err, canceled),
+            lambda idx, metric: GLib.idle_add(self._on_metric, idx, metric),
+            lambda idx, track: GLib.idle_add(self._on_track, idx, track),
         )
         self.connect('close-request', self._on_close)
         self._init_css()
         self._create_widgets()
         self._set_appearance(self._settings.get('theme', 'dark'))
-        version = backend_version()
-        if version:
-            self.engine_label.set_text(f'rsgain {version} conectado')
-            self.engine_label.add_css_class('mg-ok')
-        else:
-            self.engine_label.set_text('rsgain no encontrado — instálalo para analizar')
-            self.engine_label.add_css_class('mg-error')
-            self.run_button.set_sensitive(False)
+        self._append_log(f'MonkeyGain {__version__} · Ready to scan.\n')
+        self._refresh_backend(log_failure=True)
         self._update_collection()
-        self._append_log(f'MonkeyGain {__version__} · Listo para analizar.\n')
 
     @staticmethod
     def _read_settings() -> dict:
@@ -94,6 +91,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             'write_tags': self.write_switch.get_active(),
             'skip_existing': self.skip_switch.get_active(),
             'theme': ('system', 'light', 'dark')[self.theme_choice.get_selected()],
+            'backend_path': self.backend_entry.get_text().strip(),
         }
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -114,19 +112,12 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
 
         header = Gtk.HeaderBar()
         header.add_css_class('mg-header')
-        head_title = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        image = Gtk.Picture.new_for_filename(str(ASSET_DIR / 'monkeygain.svg'))
-        image.set_size_request(32, 32)
-        image.set_content_fit(Gtk.ContentFit.CONTAIN)
-        head_title.append(image)
-        titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
-        titles.append(label('MonkeyGain', 'mg-brand'))
-        titles.append(label('ReplayGain Studio', 'mg-muted-small'))
-        head_title.append(titles)
-        header.set_title_widget(head_title)
-        self.add_folder_button = button('Carpeta', 'folder-open-symbolic', self._choose_folder)
-        self.add_file_button = button('Archivos', 'list-add-symbolic', self._choose_files)
-        self.clear_button = button('Limpiar', 'edit-clear-all-symbolic', self._clear)
+        # Prevent Gtk.HeaderBar from adding its default centered window title.
+        # The window manager still uses the actual window title, MonkeyGain.
+        header.set_title_widget(Gtk.Box())
+        self.add_folder_button = button('Add Folder', 'folder-open-symbolic', self._choose_folder)
+        self.add_file_button = button('Add Files', 'list-add-symbolic', self._choose_files)
+        self.clear_button = button('Clear', 'edit-clear-all-symbolic', self._clear)
         header.pack_start(self.add_folder_button)
         header.pack_start(self.add_file_button)
         header.pack_end(self.clear_button)
@@ -153,10 +144,10 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         overview.set_valign(Gtk.Align.CENTER)
         headings = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         headings.set_hexpand(True)
-        headings.append(label('Tu biblioteca', 'mg-title'))
-        headings.append(label('Importa álbumes y analiza su volumen sin modificar el audio.', 'mg-description', wrap=True))
+        headings.append(label('Your Library', 'mg-title'))
+        headings.append(label('Import albums and analyze loudness without changing audio samples.', 'mg-description', wrap=True))
         overview.append(headings)
-        self.count_label = label('0 álbumes · 0 pistas', 'mg-count')
+        self.count_label = label('0 albums · 0 tracks', 'mg-count')
         overview.append(self.count_label)
         workspace.append(overview)
 
@@ -172,11 +163,11 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         workspace.append(self.album_scroller)
 
         logs_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        logs_header.append(label('Registro de análisis', 'mg-section'))
+        logs_header.append(label('Analysis Log', 'mg-section'))
         space = Gtk.Box()
         space.set_hexpand(True)
         logs_header.append(space)
-        logs_header.append(button('Exportar', 'document-save-symbolic', self._export_log))
+        logs_header.append(button('Export', 'document-save-symbolic', self._export_log))
         workspace.append(logs_header)
         log_scroll = Gtk.ScrolledWindow()
         log_scroll.set_min_content_height(147)
@@ -206,40 +197,51 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         sidebar.set_margin_bottom(20)
         sidebar_scroller.set_child(sidebar)
         content.set_end_child(sidebar_scroller)
-        sidebar.append(label('Configuración', 'mg-title'))
-        sidebar.append(label('Perfil personalizado · rsgain custom', 'mg-description'))
+        sidebar.append(label('Settings', 'mg-title'))
+        sidebar.append(label('Custom profile · rsgain custom', 'mg-description'))
         self.config_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
         sidebar.append(self.config_box)
 
         self.loud_spin = Gtk.SpinButton.new_with_range(-30, -5, 1)
         self.loud_spin.set_value(int(self._settings.get('loudness', -18)))
-        self._field('Loudness objetivo', self.loud_spin, 'LUFS')
+        self._field('Target Loudness', self.loud_spin, 'LUFS')
         self.peak_spin = Gtk.SpinButton.new_with_range(-20, 0, 0.5)
         self.peak_spin.set_digits(1)
         self.peak_spin.set_value(float(self._settings.get('max_peak', -1)))
-        self._field('Pico máximo', self.peak_spin, 'dB')
+        self._field('Maximum Peak', self.peak_spin, 'dB')
         self.clip_choice = Gtk.DropDown.new_from_strings([
-            'Solo ganancia positiva', 'Protección siempre', 'Sin protección',
+            'Positive gain only', 'Always protect', 'No protection',
         ])
         clip = self._settings.get('clip_mode', 'p')
         self.clip_choice.set_selected({'p': 0, 'a': 1, 'n': 2}.get(clip, 0))
-        self.config_box.append(self._plain_field('Protección contra clipping', self.clip_choice))
+        self.config_box.append(self._plain_field('Clipping Protection', self.clip_choice))
         sidebar.append(Gtk.Separator())
 
-        self.album_switch = self._switch('Album Gain', 'Calcula una ganancia común por carpeta',
+        self.album_switch = self._switch('Album Gain', 'Calculate a shared gain for each folder',
                                          bool(self._settings.get('album', True)), sidebar)
-        self.true_peak_switch = self._switch('True Peak', 'Detecta picos entre muestras',
+        self.true_peak_switch = self._switch('True Peak', 'Detect inter-sample peaks',
                                              bool(self._settings.get('true_peak', True)), sidebar)
-        self.write_switch = self._switch('Escribir etiquetas', 'Desactiva para analizar sin guardar cambios',
+        self.write_switch = self._switch('Write Tags', 'Turn off to scan without writing metadata',
                                          bool(self._settings.get('write_tags', True)), sidebar)
-        self.skip_switch = self._switch('Omitir pistas etiquetadas', 'Conservar ReplayGain existente',
+        self.skip_switch = self._switch('Skip Existing Tags', 'Keep existing ReplayGain values',
                                         bool(self._settings.get('skip_existing', False)), sidebar)
         sidebar.append(Gtk.Separator())
-        self.theme_choice = Gtk.DropDown.new_from_strings(['Sistema', 'Claro', 'Oscuro'])
+        self.theme_choice = Gtk.DropDown.new_from_strings(['System', 'Light', 'Dark'])
         self.theme_choice.set_selected({'system': 0, 'light': 1, 'dark': 2}.get(
             self._settings.get('theme', 'dark'), 2))
-        sidebar.append(self._plain_field('Apariencia', self.theme_choice))
-        sidebar.append(label('Los álbumes se agrupan por carpeta. No mezcles discos distintos en una carpeta.',
+        sidebar.append(self._plain_field('Appearance', self.theme_choice))
+        sidebar.append(Gtk.Separator())
+        sidebar.append(label('rsgain Executable', 'mg-field-label'))
+        self.backend_entry = Gtk.Entry()
+        self.backend_entry.set_text(self._settings.get('backend_path', ''))
+        self.backend_entry.set_placeholder_text('Auto-detect')
+        self.backend_entry.set_tooltip_text('Leave blank to search PATH and standard Linux locations.')
+        sidebar.append(self.backend_entry)
+        self.backend_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.backend_row.append(button('Browse…', 'document-open-symbolic', self._browse_backend))
+        self.backend_row.append(button('Check', 'view-refresh-symbolic', self._check_backend))
+        sidebar.append(self.backend_row)
+        sidebar.append(label('Albums are grouped by folder. Do not mix separate albums in the same folder.',
                              'mg-hint', wrap=True))
 
         for control in (self.loud_spin, self.peak_spin):
@@ -248,6 +250,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             control.connect('notify::active', self._save_settings)
         self.clip_choice.connect('notify::selected', self._save_settings)
         self.theme_choice.connect('notify::selected', self._theme_changed)
+        self.backend_entry.connect('changed', self._save_settings)
 
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         footer.set_margin_start(22)
@@ -257,9 +260,9 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         footer.add_css_class('mg-footer')
         status_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         status_box.set_hexpand(True)
-        self.status_label = label('Listo · Selecciona archivos o carpetas', 'mg-description')
+        self.status_label = label('Ready · Add files or folders', 'mg-description')
         status_box.append(self.status_label)
-        self.engine_label = label('Comprobando motor…', 'mg-muted-small')
+        self.engine_label = label('Checking rsgain…', 'mg-muted-small')
         status_box.append(self.engine_label)
         footer.append(status_box)
         self.progress = Gtk.ProgressBar()
@@ -267,12 +270,12 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self.progress.set_valign(Gtk.Align.CENTER)
         self.progress.set_show_text(True)
         self.progress.set_fraction(0)
-        self.progress.set_text('0 % · álbumes')
+        self.progress.set_text('0% · albums')
         footer.append(self.progress)
-        self.cancel_button = button('Cancelar', 'process-stop-symbolic', self._cancel)
+        self.cancel_button = button('Cancel', 'process-stop-symbolic', self._cancel)
         self.cancel_button.set_sensitive(False)
         footer.append(self.cancel_button)
-        self.run_button = button('Iniciar análisis', 'media-playback-start-symbolic', self._confirm_start, 'mg-primary')
+        self.run_button = button('Start Scan', 'media-playback-start-symbolic', self._confirm_start, 'mg-primary')
         footer.append(self.run_button)
         root.append(footer)
 
@@ -286,8 +289,8 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         icon.set_pixel_size(54)
         icon.add_css_class('mg-muted')
         block.append(icon)
-        block.append(label('Tu música empieza aquí', 'mg-section', xalign=0.5))
-        block.append(label('Usa «Archivos» o «Carpeta» para crear la cola.', 'mg-description', xalign=0.5))
+        block.append(label('Your music starts here', 'mg-section', xalign=0.5))
+        block.append(label('Choose Add Files or Add Folder to create a scan queue.', 'mg-description', xalign=0.5))
         return block
 
     def _plain_field(self, title: str, widget: Gtk.Widget) -> Gtk.Box:
@@ -342,9 +345,45 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self.add_css_class('mg-dark' if dark else 'mg-light')
         Gtk.Settings.get_default().set_property('gtk-application-prefer-dark-theme', dark)
 
+    def _refresh_backend(self, *, log_failure: bool = False):
+        self.backend = probe_backend(self.backend_entry.get_text())
+        for css in ('mg-ok', 'mg-error'):
+            self.engine_label.remove_css_class(css)
+        if self.backend.path:
+            self.engine_label.set_text(f'rsgain {self.backend.version} · Ready' if self.backend.version != 'unknown' else 'rsgain · Ready')
+            self.engine_label.set_tooltip_text(self.backend.path)
+            self.engine_label.add_css_class('mg-ok')
+            self._append_log(f'Engine detected: {self.backend.path} (version: {self.backend.version})\n')
+        else:
+            self.engine_label.set_text('rsgain unavailable · Check executable path')
+            self.engine_label.set_tooltip_text(self.backend.error)
+            self.engine_label.add_css_class('mg-error')
+            if log_failure:
+                self._append_log('Engine diagnostics:\n' + self.backend.error + '\n')
+        if not self._runner.running:
+            self.run_button.set_sensitive(bool(self._jobs) and bool(self.backend.path) and not self._busy)
+
+    def _check_backend(self, *_args):
+        self._save_settings()
+        self._refresh_backend(log_failure=True)
+
+    def _browse_backend(self, *_args):
+        dialog = Gtk.FileDialog()
+        dialog.set_title('Choose rsgain Executable')
+        dialog.open(self, None, self._on_backend_selected)
+
+    def _on_backend_selected(self, dialog, result):
+        try:
+            file = dialog.open_finish(result)
+            if file.get_path():
+                self.backend_entry.set_text(file.get_path())
+                self._check_backend()
+        except GLib.Error:
+            return
+
     def _choose_files(self, *_args):
         dialog = Gtk.FileDialog()
-        dialog.set_title('Seleccionar canciones')
+        dialog.set_title('Select Audio Files')
         dialog.open_multiple(self, None, self._on_files_selected)
 
     def _on_files_selected(self, dialog, result):
@@ -353,13 +392,13 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             files = [model.get_item(n).get_path() for n in range(model.get_n_items())]
         except GLib.Error as exc:
             if not exc.matches(Gtk.dialog_error_quark(), Gtk.DialogError.DISMISSED):
-                self._append_log(f'No se pudieron seleccionar archivos: {exc}\n')
+                self._append_log(f'Could not select files: {exc}\n')
             return
         self._discover(files)
 
     def _choose_folder(self, *_args):
         dialog = Gtk.FileDialog()
-        dialog.set_title('Seleccionar carpeta de música')
+        dialog.set_title('Select Music Folder')
         dialog.select_folder(self, None, self._on_folder_selected)
 
     def _on_folder_selected(self, dialog, result):
@@ -367,7 +406,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             folder = dialog.select_folder_finish(result)
         except GLib.Error as exc:
             if not exc.matches(Gtk.dialog_error_quark(), Gtk.DialogError.DISMISSED):
-                self._append_log(f'No se pudo seleccionar la carpeta: {exc}\n')
+                self._append_log(f'Could not select folder: {exc}\n')
             return
         self._discover([folder.get_path()])
 
@@ -379,7 +418,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             return
         self._busy = True
         self._set_import_sensitive(False)
-        self.status_label.set_text('Buscando archivos compatibles…')
+        self.status_label.set_text('Searching for supported audio files…')
 
         def task():
             try:
@@ -393,12 +432,12 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self._busy = False
         self._set_import_sensitive(True)
         if error:
-            self._append_log(f'Error al importar: {error}\n')
+            self._append_log(f'Import error: {error}\n')
         old = len(self._files)
         self._files.update(new_files)
-        self.status_label.set_text(f'{len(self._files) - old} archivos nuevos añadidos')
+        self.status_label.set_text(f'{len(self._files) - old} new files added')
         if not new_files:
-            self._append_log('No se encontraron archivos compatibles con rsgain 3.4.\n')
+            self._append_log('No supported audio files were found.\n')
         self._update_collection()
         return GLib.SOURCE_REMOVE
 
@@ -406,14 +445,165 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         if self._runner.running or self._busy:
             return
         self._files.clear()
+        self._results.clear()
         self._update_collection()
-        self.status_label.set_text('Lista vacía')
+        self.status_label.set_text('Queue cleared')
 
     def _remove_folder(self, _button, folder: Path):
         if self._runner.running or self._busy:
             return
         self._files = {file for file in self._files if file.parent != folder}
+        self._results.pop(folder, None)
         self._update_collection()
+
+    @staticmethod
+    def _plural(number: int, singular: str, plural: str | None = None) -> str:
+        return f'{number} {singular if number == 1 else (plural or singular + "s")}'
+
+    @staticmethod
+    def _fmt_number(number: float, unit: str = '', *, signed: bool = False) -> str:
+        if number == float('-inf'):
+            return '−∞' + (' ' + unit if unit else '')
+        prefix = '+' if signed and number > 0 else ''
+        return f'{prefix}{number:.2f}' + (' ' + unit if unit else '')
+
+    def _make_album_row(self, job, position: int) -> dict:
+        item = Gtk.ListBoxRow()
+        item.add_css_class('mg-album-row')
+        wrapper = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        item.set_child(wrapper)
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        header.add_css_class('mg-album-heading')
+        toggle = Gtk.ToggleButton()
+        toggle.set_active(position == 0)
+        toggle.set_tooltip_text('Expand or collapse tracks')
+        toggle.add_css_class('mg-expand-button')
+        arrow = Gtk.Image.new_from_icon_name('pan-end-symbolic')
+        toggle.set_child(arrow)
+        header.append(toggle)
+
+        album_art = Gtk.Box()
+        album_art.add_css_class('mg-album-icon')
+        art_icon = Gtk.Image.new_from_icon_name('media-optical-symbolic')
+        art_icon.set_pixel_size(23)
+        album_art.append(art_icon)
+        header.append(album_art)
+
+        titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        titles.set_hexpand(True)
+        title = label(job.label, 'mg-album-title')
+        title.set_ellipsize(Pango.EllipsizeMode.END)
+        title.set_tooltip_text(str(job.folder))
+        titles.append(title)
+        formats = ' / '.join(sorted({p.suffix[1:].upper() for p in job.files}))
+        titles.append(label(f'{self._plural(len(job.files), "track")}  ·  {formats}', 'mg-muted-small'))
+        header.append(titles)
+        status_icon = Gtk.Image.new_from_icon_name('emblem-ok-symbolic')
+        status_icon.set_visible(False)
+        header.append(status_icon)
+        status = label('Ready', 'mg-status')
+        header.append(status)
+        remove = Gtk.Button.new_from_icon_name('window-close-symbolic')
+        remove.set_tooltip_text('Remove album from the queue')
+        remove.add_css_class('flat')
+        remove.connect('clicked', self._remove_folder, job.folder)
+        header.append(remove)
+        wrapper.append(header)
+
+        revealer = Gtk.Revealer()
+        revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        revealer.set_transition_duration(160)
+        revealer.set_reveal_child(position == 0)
+        toggle.connect('toggled', lambda control: (
+            revealer.set_reveal_child(control.get_active()),
+            arrow.set_from_icon_name('pan-down-symbolic' if control.get_active() else 'pan-end-symbolic'),
+        ))
+        if position == 0:
+            arrow.set_from_icon_name('pan-down-symbolic')
+        wrapper.append(revealer)
+        details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        details.add_css_class('mg-details')
+        revealer.set_child(details)
+
+        album_stats = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        album_stats.add_css_class('mg-album-stats')
+        stat_values = {}
+        for title_text, key in [('ALBUM GAIN', 'gain'), ('LOUDNESS', 'loudness'), ('ALBUM PEAK', 'peak')]:
+            column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+            column.set_hexpand(True)
+            column.append(label(title_text, 'mg-overline'))
+            value = label('—', 'mg-stat-value')
+            column.append(value)
+            album_stats.append(column)
+            stat_values[key] = value
+        details.append(album_stats)
+
+        columns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        columns.add_css_class('mg-track-columns')
+        index_space = label('', 'mg-overline')
+        index_space.set_width_chars(3)
+        columns.append(index_space)
+        track_title = label('TRACK', 'mg-overline')
+        track_title.set_hexpand(True)
+        columns.append(track_title)
+        format_space = label('', 'mg-overline')
+        format_space.set_width_chars(5)
+        columns.append(format_space)
+        for caption in ('LOUDNESS', 'GAIN', 'PEAK'):
+            head = label(caption, 'mg-overline', xalign=1)
+            head.set_width_chars(11)
+            head.set_max_width_chars(11)
+            columns.append(head)
+        details.append(columns)
+
+        track_widgets = {}
+        for n, file in enumerate(job.files, start=1):
+            track_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            track_row.add_css_class('mg-track-row')
+            number = label(f'{n:02}', 'mg-track-index')
+            number.set_width_chars(3)
+            track_row.append(number)
+            name = label(file.stem, 'mg-track-name')
+            name.set_hexpand(True)
+            name.set_ellipsize(Pango.EllipsizeMode.END)
+            name.set_tooltip_text(file.name)
+            track_row.append(name)
+            suffix = label(file.suffix[1:].upper(), 'mg-track-format')
+            suffix.set_width_chars(5)
+            track_row.append(suffix)
+            values = {}
+            for key in ('loudness', 'gain', 'peak'):
+                value = label('—', 'mg-track-value', xalign=1)
+                value.set_width_chars(11)
+                value.set_max_width_chars(11)
+                track_row.append(value)
+                values[key] = value
+            details.append(track_row)
+            track_widgets[file.name] = {'values': values, 'row': track_row}
+        self.album_list.append(item)
+        return {
+            'status': status, 'icon': status_icon, 'revealer': revealer,
+            'toggle': toggle, 'stat_values': stat_values,
+            'tracks': track_widgets, 'folder': job.folder,
+        }
+
+    def _apply_metrics(self, row: dict, result: dict) -> None:
+        album: ScanMetric | None = result.get('album')
+        stats = row['stat_values']
+        stats['gain'].set_text(self._fmt_number(album.gain, 'dB', signed=True) if album else '—')
+        stats['loudness'].set_text(self._fmt_number(album.loudness, 'LUFS') if album else '—')
+        stats['peak'].set_text(self._fmt_number(album.peak_db, 'dBTP' if album.peak_type == 'True' else 'dBFS') if album else '—')
+        for name, item in row['tracks'].items():
+            metric: ScanMetric | None = result.get('tracks', {}).get(name)
+            values = item['values']
+            values['loudness'].set_text(self._fmt_number(metric.loudness) if metric else '—')
+            values['gain'].set_text(self._fmt_number(metric.gain, 'dB', signed=True) if metric else '—')
+            values['peak'].set_text(self._fmt_number(metric.peak_db, 'dB') if metric else '—')
+            if metric:
+                values['peak'].set_tooltip_text(f'{metric.peak_type} peak: {metric.peak:.6f} linear')
+                if metric.clipping_adjusted:
+                    values['gain'].set_tooltip_text('Gain reduced to prevent clipping')
+                    values['gain'].add_css_class('mg-adjusted')
 
     def _update_collection(self):
         self._jobs = make_album_jobs(self._files)
@@ -421,42 +611,39 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         while row := self.album_list.get_row_at_index(0):
             self.album_list.remove(row)
         ntracks = sum(len(job.files) for job in self._jobs)
-        self.count_label.set_text(f'{len(self._jobs)} álbum(es) · {ntracks} pistas')
-        for job in self._jobs:
-            item = Gtk.ListBoxRow()
-            item.add_css_class('mg-album-row')
-            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-            row.set_margin_start(14)
-            row.set_margin_end(12)
-            row.set_margin_top(11)
-            row.set_margin_bottom(11)
-            row.append(Gtk.Image.new_from_icon_name('folder-music-symbolic'))
-            lines = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-            lines.set_hexpand(True)
-            name_label = label(elide(job.label, 70), 'mg-album-title')
-            name_label.set_tooltip_text(str(job.folder))
-            lines.append(name_label)
-            formats = ', '.join(sorted({p.suffix[1:].upper() for p in job.files}))
-            info = f'{len(job.files)} pistas · {formats}'
-            lines.append(label(elide(info, 60), 'mg-muted-small'))
-            row.append(lines)
-            status_icon = Gtk.Image.new_from_icon_name('content-loading-symbolic')
-            status_icon.set_visible(False)
-            row.append(status_icon)
-            status = label('Pendiente', 'mg-status')
-            row.append(status)
-            remove = Gtk.Button.new_from_icon_name('window-close-symbolic')
-            remove.set_tooltip_text('Quitar álbum de la lista')
-            remove.add_css_class('flat')
-            remove.connect('clicked', self._remove_folder, job.folder)
-            row.append(remove)
-            item.set_child(row)
-            self.album_list.append(item)
-            self._rows.append((status, status_icon))
+        self.count_label.set_text(f'{self._plural(len(self._jobs), "album")}  ·  {self._plural(ntracks, "track")}')
+        for position, job in enumerate(self._jobs):
+            row = self._make_album_row(job, position)
+            self._apply_metrics(row, self._results.get(job.folder, {}))
+            self._rows.append(row)
         if not self._runner.running:
             self.progress.set_fraction(0)
-            self.progress.set_text('0 % · álbumes')
-            self.run_button.set_sensitive(bool(self._jobs) and backend_version() is not None)
+            self.progress.set_text('0% · albums')
+            self.run_button.set_sensitive(bool(self._jobs) and bool(self.backend.path) and not self._busy)
+
+    def _on_metric(self, index: int, metric: ScanMetric):
+        if index >= len(self._jobs) or index >= len(self._rows):
+            return GLib.SOURCE_REMOVE
+        folder = self._jobs[index].folder
+        result = self._results.setdefault(folder, {'tracks': {}, 'album': None})
+        if metric.is_album:
+            result['album'] = metric
+        else:
+            result['tracks'][metric.filename] = metric
+        self._apply_metrics(self._rows[index], result)
+        return GLib.SOURCE_REMOVE
+
+    def _on_track(self, index: int, filename: str):
+        if index >= len(self._rows):
+            return GLib.SOURCE_REMOVE
+        self.status_label.set_text(f'Scanning: {filename}  ·  {index + 1}/{len(self._rows)} albums')
+        row = self._rows[index]
+        for trackname, item in row['tracks'].items():
+            if trackname == filename:
+                item['row'].add_css_class('mg-active-track')
+            else:
+                item['row'].remove_css_class('mg-active-track')
+        return GLib.SOURCE_REMOVE
 
     def _scan_settings(self) -> ScanSettings:
         return ScanSettings(
@@ -479,15 +666,15 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         dialog = Gtk.MessageDialog(
             transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
             buttons=Gtk.ButtonsType.NONE,
-            text='¿Escribir etiquetas ReplayGain?',
+            text='Write ReplayGain Tags?',
         )
         dialog.props.secondary_text = (
-            f'rsgain actualizará los metadatos de {sum(len(j.files) for j in self._jobs)} '
-            'archivos. Las muestras de audio no cambiarán, pero se modificarán las etiquetas. '
-            'Es recomendable probar primero con una copia de un álbum.'
+            f'rsgain will update metadata in {sum(len(j.files) for j in self._jobs)} '
+            'audio files. The audio samples will not change, but tags will be modified. '
+            'We recommend testing with a copy of an album first.'
         )
-        dialog.add_button('Cancelar', Gtk.ResponseType.CANCEL)
-        dialog.add_button('Escribir etiquetas', Gtk.ResponseType.ACCEPT)
+        dialog.add_button('Cancel', Gtk.ResponseType.CANCEL)
+        dialog.add_button('Write Tags', Gtk.ResponseType.ACCEPT)
         dialog.set_default_response(Gtk.ResponseType.CANCEL)
         dialog.connect('response', self._confirm_response, config)
         dialog.present()
@@ -500,24 +687,25 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
     def _start(self, config: ScanSettings):
         self._save_settings()
         self.log_view.get_buffer().set_text('')
-        for status, image in self._rows:
-            status.set_text('Pendiente')
-            image.set_visible(False)
+        self._results.clear()
+        self._update_collection()
+        for row in self._rows:
+            row['status'].set_text('Queued')
+            row['icon'].set_visible(False)
         self.progress.set_fraction(0)
-        self.progress.set_text('0 % · álbumes')
+        self.progress.set_text('0% · albums')
         self.run_button.set_sensitive(False)
         self.cancel_button.set_sensitive(True)
         self._set_import_sensitive(False)
         self.config_box.set_sensitive(False)
-        self.album_switch.set_sensitive(False)
-        self.true_peak_switch.set_sensitive(False)
-        self.write_switch.set_sensitive(False)
-        self.skip_switch.set_sensitive(False)
-        self.status_label.set_text('Iniciando análisis…')
+        for control in (self.album_switch, self.true_peak_switch, self.write_switch, self.skip_switch,
+                        self.theme_choice, self.clip_choice, self.backend_entry, self.backend_row):
+            control.set_sensitive(False)
+        self.status_label.set_text('Starting scan…')
         try:
-            self._runner.start(list(self._jobs), config)
+            self._runner.start(list(self._jobs), config, self.backend.path or 'rsgain')
         except Exception as exc:
-            self._append_log(f'No se pudo iniciar: {exc}\n')
+            self._append_log(f'Could not start scan: {exc}\n')
             self._on_finished(0, 1, False)
 
     def _set_import_sensitive(self, active: bool):
@@ -527,47 +715,52 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
 
     def _on_job(self, index: int, status: str):
         mapping = {
-            'running': ('Analizando…', 'media-playback-start-symbolic'),
-            'success': ('Completado', 'emblem-ok-symbolic'),
-            'failed': ('Error', 'dialog-error-symbolic'),
-            'cancelled': ('Cancelado', 'process-stop-symbolic'),
+            'running': ('Scanning…', 'media-playback-start-symbolic'),
+            'success': ('Completed', 'emblem-ok-symbolic'),
+            'failed': ('Failed', 'dialog-error-symbolic'),
+            'cancelled': ('Cancelled', 'process-stop-symbolic'),
         }
         if index >= len(self._rows):
             return GLib.SOURCE_REMOVE
-        caption, icon_name = mapping.get(status, ('Pendiente', 'content-loading-symbolic'))
-        item, image = self._rows[index]
-        item.set_text(caption)
-        image.set_from_icon_name(icon_name)
-        image.set_visible(True)
-        if status != 'running':
-            finished = sum(label_.get_text() in ('Completado', 'Error', 'Cancelado') for label_, _ in self._rows)
-            self.progress.set_fraction(finished / len(self._rows))
-            self.progress.set_text(f'{finished}/{len(self._rows)} álbumes')
+        caption, icon_name = mapping.get(status, ('Queued', 'content-loading-symbolic'))
+        row = self._rows[index]
+        row['status'].set_text(caption)
+        row['icon'].set_from_icon_name(icon_name)
+        row['icon'].set_visible(True)
+        if status == 'running':
+            row['toggle'].set_active(True)
+            self.status_label.set_text(f'Scanning album {index + 1}/{len(self._rows)}: {self._jobs[index].label}')
         else:
-            self.status_label.set_text(f'Analizando {index + 1}/{len(self._rows)}: {self._jobs[index].label}')
+            for item in row['tracks'].values():
+                item['row'].remove_css_class('mg-active-track')
+            done = sum(x['status'].get_text() in ('Completed', 'Failed', 'Cancelled') for x in self._rows)
+            self.progress.set_fraction(done / len(self._rows))
+            self.progress.set_text(f'{done}/{len(self._rows)} albums')
         return GLib.SOURCE_REMOVE
 
     def _on_finished(self, success: int, errors: int, cancelled: bool):
         self.config_box.set_sensitive(True)
-        self.album_switch.set_sensitive(True)
-        self.true_peak_switch.set_sensitive(True)
-        self.write_switch.set_sensitive(True)
-        self.skip_switch.set_sensitive(True)
+        for control in (self.album_switch, self.true_peak_switch, self.write_switch, self.skip_switch,
+                        self.theme_choice, self.clip_choice, self.backend_entry, self.backend_row):
+            control.set_sensitive(True)
         self._set_import_sensitive(True)
         self.cancel_button.set_sensitive(False)
-        self.run_button.set_sensitive(bool(self._jobs))
+        self.run_button.set_sensitive(bool(self._jobs) and bool(self.backend.path))
         if cancelled:
-            message = f'Cancelado · {success} álbumes completados, {errors} con error'
+            message = f'Scan cancelled · {self._plural(success, "album")} completed, {errors} failed'
+            finished = sum(x['status'].get_text() in ('Completed', 'Failed', 'Cancelled') for x in self._rows)
+            if self._rows:
+                self.progress.set_fraction(finished / len(self._rows))
         else:
-            message = f'Finalizado · {success} álbumes completados, {errors} con error'
+            message = f'Scan finished · {self._plural(success, "album")} completed, {errors} failed'
             self.progress.set_fraction(1)
-            self.progress.set_text('Proceso terminado')
+            self.progress.set_text('Scan finished')
         self.status_label.set_text(message)
         self._append_log(f'\n{message}\n')
         return GLib.SOURCE_REMOVE
 
     def _cancel(self, *_args):
-        self.status_label.set_text('Solicitando cancelación…')
+        self.status_label.set_text('Cancelling scan…')
         self._runner.cancel()
         self.cancel_button.set_sensitive(False)
 
@@ -580,7 +773,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
 
     def _export_log(self, *_args):
         dialog = Gtk.FileDialog()
-        dialog.set_title('Guardar registro')
+        dialog.set_title('Save Analysis Log')
         dialog.set_initial_name('monkeygain-log.txt')
         dialog.save(self, None, self._on_log_saved)
 
@@ -589,15 +782,15 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             file = dialog.save_finish(result)
             path = file.get_path()
             if not path:
-                raise OSError('Selecciona una ubicación local.')
+                raise OSError('Choose a local destination.')
             buffer = self.log_view.get_buffer()
             text = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True)
             Path(path).write_text(text, encoding='utf-8')
-            self.status_label.set_text('Registro exportado correctamente')
+            self.status_label.set_text('Log exported successfully')
         except GLib.Error:
             return
         except OSError as exc:
-            self._append_log(f'No se pudo exportar el registro: {exc}\n')
+            self._append_log(f'Could not export log: {exc}\n')
 
     def _on_close(self, *_args):
         if self._runner.running:

@@ -1,131 +1,163 @@
 # 🐒 MonkeyGain
 
-**MonkeyGain** es una aplicación de escritorio GTK 4 para analizar y escribir etiquetas ReplayGain mediante [`rsgain`](https://github.com/complexlogic/rsgain). Está diseñada como proyecto personal para Linux, especialmente elementary OS 8.1.
+**MonkeyGain** is a lightweight, native GTK 4 desktop application for scanning music with [rsgain](https://github.com/complexlogic/rsgain). Inspired by the simplicity of elementary OS, it offers a clean interface, an expandable album library, and real ReplayGain analysis results without re-encoding audio.
 
-> Versión inicial **0.1.0**: primera implementación funcional del frontend. Antes de procesar una colección valiosa, prueba con una **copia** de un álbum y comprueba los resultados.
+**Current version: 0.2.0 — early preview.** The Python core is covered by automated tests. The GTK UI should be tested on an actual Linux desktop before relying on it for valuable music. **Back up your files before enabling tag writing.**
 
-## Características
+## Features
 
-- Interfaz gráfica nativa GTK 4 con temas oscuro, claro o del sistema.
-- Importar archivos sueltos o carpetas recursivamente.
-- Análisis multiformato: FLAC, MP3, M4A (AAC/ALAC), Opus, Ogg, WAV, AIFF, WavPack, Monkey's Audio, MP2, MPC, TAK y WMA (dependiendo del backend y los códecs instalados).
-- Cada carpeta se procesa por separado como un álbum; no mezcla álbumes distintos.
-- Configuración de Album Gain, True Peak, loudness, clipping y peak máximo.
-- Modo de solo análisis (`--tagmode=s`), sin escritura, o escritura de etiquetas (`--tagmode=i`).
-- Confirmación antes de escribir etiquetas, registro de ejecución, exportación del registro y cancelación.
-- Preferencias persistentes en `~/.config/monkeygain/settings.json` (no se suben a GitHub).
-- Comandos ejecutados sin `shell=True`, con nombres de archivo seguros y rutas con espacios.
+- Native GTK 4 layout with **Dark**, **Light**, and **System** appearance modes.
+- Import individual songs or entire directories, including recursively discovered albums.
+- **Expandable album cards** with track names and formats.
+- **Per-track results**: measured loudness (LUFS), calculated Track Gain (dB), and peak (dB).
+- **Album results**: measured loudness, calculated Album Gain, and album peak, when album analysis is enabled.
+- Uses `rsgain custom --output` to read structured **tab-separated results directly from rsgain**, not guessed from text or metadata.
+- Configurable target loudness, True Peak, clipping protection, maximum peak, Album Gain, and ReplayGain tag writing.
+- A scan-only option (`--tagmode=s`) that does not write ReplayGain tags; confirmation before writing tags (`--tagmode=i`).
+- Background scanning, cancellation, completed-album progress, and an exportable diagnostic log.
+- Automatically locates the rsgain executable, with a manual path option.
+- Supports filenames containing spaces and Unicode characters; subprocesses never run through a shell.
+- Automatically saves preferences in `~/.config/monkeygain/settings.json` (outside the Git repository).
 
-## Requisitos en elementary OS 8.1 / Ubuntu 24.04
+## Requirements
+
+- Linux with GTK 4 and PyGObject; developed with **elementary OS 8.1**, **Python 3.12**, **GTK 4.14**, and **rsgain 3.4** in mind.
+- `rsgain` installed and accessible either via `PATH` or an absolute path selected in Settings.
+
+On elementary OS 8.1 / Ubuntu 24.04:
 
 ```bash
 sudo apt update
 sudo apt install python3 python3-gi python3-gi-cairo gir1.2-gtk-4.0 rsgain
 ```
 
-`rsgain` debe funcionar desde la terminal; confirma con `rsgain --version` y `rsgain custom --help`.
-
-**No necesitas `pip install` ni un entorno virtual** para ejecutar la primera versión: utiliza los paquetes GTK/PyGObject instalados por el sistema.
-
-## Ejecutar desde Visual Studio Code
-
-Guarda el repositorio en `/data/Projects/MonkeyGain` y abre la carpeta completa:
+Verify the dependencies:
 
 ```bash
-mkdir -p /data/Projects
+rsgain --version
+python3 -c "import gi; gi.require_version('Gtk', '4.0'); from gi.repository import Gtk; print(Gtk.get_major_version(), Gtk.get_minor_version())"
+```
+
+The application uses system-provided PyGObject. A `pip` environment is not required.
+
+## Install from source / run in VS Code
+
+Clone the repository or unpack a release archive. For example:
+
+```bash
 cd /data/Projects/MonkeyGain
 code .
 python3 run.py
 ```
 
-También puedes lanzar `python3 run.py` desde la terminal integrada de VS Code o utilizar la configuración de depuración incluida en `.vscode/launch.json`.
+A VS Code launch configuration is included in `.vscode/launch.json` for debugging with F5.
 
-## Uso
+## How to use MonkeyGain
 
-1. Pulsa **Archivos** para elegir pistas o **Carpeta** para importar recursivamente.
-2. Revisa el listado: cada carpeta con audio pasa a ser un trabajo de álbum independiente.
-3. Ajusta parámetros del panel lateral. Los valores predeterminados replican:
+1. Choose **Add Folder** or **Add Files**. Folders are scanned recursively.
+2. Expand an album with the arrow on the left to see the files queued for that album.
+3. Review the **Settings** panel; the default profile matches:
 
    ```bash
-   rsgain custom --album --true-peak --loudness=-18 --clip-mode=p --max-peak=-1 --tagmode=i archivo1.flac archivo2.flac
+   rsgain custom --album --true-peak --loudness=-18 --clip-mode=p --max-peak=-1 --tagmode=i file1.flac file2.flac
    ```
 
-4. Para probar **sin escribir metadatos**, desactiva *Escribir etiquetas* y haz clic en **Iniciar análisis**.
-5. Si decides escribir etiquetas, la aplicación te pedirá confirmación. Usa copias para las primeras pruebas.
-6. Revisa el registro y exporta el archivo de texto si necesitas auditar los resultados.
+   MonkeyGain additionally passes **`--output`**, which emits tab-separated results to standard output. Files are passed as individual arguments, not expanded with `*.flac`.
+4. For a first test, **turn off Write Tags**. The resulting scan uses `--tagmode=s` and does not modify metadata.
+5. Click **Start Scan**. If Write Tags is enabled, confirm the metadata change dialog.
+6. Check **Album Gain**, **Loudness**, and **Album Peak** in the expanded album summary, and each track's **Loudness**, **Gain**, and **Peak** in the rows below it.
+7. Use **Export** to save the full analysis log.
 
-### Cómo se agrupan los álbumes
+### Understanding the results
 
-MonkeyGain **agrupa por directorio padre**, no leyendo las etiquetas ALBUM o ALBUMARTIST. Si tienes dos álbumes dentro de una misma carpeta, muévelos a carpetas separadas antes del análisis Album Gain. De la misma forma, los discos de un álbum repartidos en dos carpetas se analizan por separado en esta versión.
+- **Loudness** is the measured integrated loudness in LUFS, not your target setting.
+- **Gain** is the ReplayGain adjustment recommended by rsgain in dB. Positive or negative values are possible.
+- **Peak** is a dB value; when True Peak is enabled it is a true-peak measurement, otherwise a sample peak. Hover over a track's Peak result to see the underlying linear peak and peak mode.
+- **Album Gain / Album Peak** appear only when `Album Gain` is enabled **and** the scanner supplies an album result.
+- The dash (`—`) means **no result was provided**. This can happen before scanning, for skipped tracks, on failure, or with older/different backend behavior.
+- Yellow gain tooltip indicates an adjustment to prevent clipping when reported by rsgain.
+- A **Completed** status means the backend returned success, **not** that every ReplayGain field has been read back from the file. Review the log for details.
 
-### Formatos de rsgain 3.4
+### Album grouping and progress
 
-La lista de extensiones admitidas por esta versión está alineada con [la documentación de rsgain v3.4](https://github.com/complexlogic/rsgain/blob/v3.4/README.md#supported-file-formats). **No** incluye DSF, WebM o Matroska porque rsgain agregó esos formatos en la versión 3.8.
+An **album is one parent folder**, not a metadata-based album grouping. When scanning a directory containing several album subfolders, each subfolder becomes its own scan job. If two albums share a folder, separate them before Album Gain scanning. Multidisc albums stored in separate folders are treated as separate jobs.
 
-El hecho de reconocer una extensión no garantiza que el decodificador correspondiente esté disponible en tu instalación de FFmpeg. El registro mostrará los errores que devuelva `rsgain`.
+The progress bar counts **completed album jobs**, not elapsed playback time or audio frames. On rsgain 3.4, `--output` automatically suppresses normal scanning progress messages, so MonkeyGain **cannot display a live per-track percentage**. Track measurements appear when rsgain emits its results at the end of the album scan.
 
-### Notas sobre ReplayGain
+### Supported formats
 
-- `rsgain` escribe **metadatos de ganancia**, sin volver a codificar ni alterar las muestras de audio.
-- El reproductor debe ser compatible con ReplayGain para usar estos valores en la reproducción.
-- En Opus existen convenciones adicionales R128. Esta primera versión usa el comportamiento predeterminado de `rsgain 3.4` para Opus.
-- Para valores numéricos detallados por pista y álbum, consulta la salida registrada por `rsgain`; la versión inicial no interpreta estos datos en una tabla estructurada.
-- La barra de progreso mide **álbumes terminados**, no porcentaje exacto del tiempo de audio analizado.
+For rsgain 3.4, MonkeyGain recognizes these extensions:
 
-## Probar el núcleo
+`.flac`, `.mp3`, `.mp2`, `.m4a` (AAC/ALAC), `.mp4`, `.ogg`, `.oga`, `.spx`, `.opus`, `.wav`, `.aif`, `.aiff`, `.snd`, `.wv`, `.ape`, `.mpc`, `.tak`, `.wma`.
+
+The actual codec support is determined by the **installed build of rsgain / FFmpeg**. Newer extensions (`.mka`, `.mkv`, `.webm`, `.dsf`) are intentionally not advertised for rsgain 3.4. Mixed file formats in one album folder are supported when the backend can process them.
+
+### Troubleshooting rsgain detection
+
+If MonkeyGain shows that rsgain is unavailable, run:
 
 ```bash
-python3 -m unittest discover -s tests -v
+command -v rsgain
+readlink -f "$(command -v rsgain)"
 ```
 
-Estas pruebas no necesitan archivos musicales reales ni GTK.
+Enter the resolved executable path under **Settings → rsgain Executable** and select **Check**. The exact path is used for scanning. If `--version` succeeds but doesn't expose a recognizable version number, the status reads **rsgain · Ready**. This is not a failure.
 
-## Estructura
+## Development and tests
+
+```bash
+cd /data/Projects/MonkeyGain
+python3 -m unittest discover -s tests -v
+python3 -m compileall -q monkeygain
+```
+
+The test suite covers recursive multiformat discovery, per-folder job creation, safe `rsgain custom` command generation, executable detection, parsing TSV Track/Album Gain results, and a mocked subprocess scan. It does **not** replace manual GTK desktop testing.
+
+## Repository structure
 
 ```text
 MonkeyGain/
 ├── monkeygain/
-│   ├── __init__.py           # Versión y paquete
-│   ├── core.py               # Agrupación, opciones y motor de análisis
-│   └── app.py                # Interfaz GTK 4
+│   ├── __init__.py
+│   ├── app.py                 # GTK 4 application and expandable library
+│   └── core.py                # Discovery, rsgain invocation, TSV parser
 ├── assets/
-│   ├── monkeygain.svg        # Icono del proyecto
-│   └── style.css             # Apariencia claro/oscuro
+│   ├── monkeygain.svg        # App icon
+│   └── style.css             # Light/dark appearance and album cards
 ├── tests/
-│   └── test_core.py          # Pruebas del motor
+│   ├── test_core.py
+│   └── test_results.py
 ├── .vscode/
-│   ├── launch.json           # F5 para depurar
-│   └── settings.json
-├── .gitignore
+├── CHANGELOG.md
+├── CONTRIBUTING.md
 ├── LICENSE
-└── run.py                   # Punto de entrada
+├── README.md
+└── run.py
 ```
 
-## Publicar en GitHub
+## Updating an existing GitHub repository
 
-**Crea un repositorio vacío y público en GitHub llamado `MonkeyGain`**, sin inicializarlo con README ni `.gitignore` porque ya están aquí. Luego:
+If you already have a local Git repository, **do not run `git init` or add the remote again**. Update the source files in your working directory, then run:
 
 ```bash
 cd /data/Projects/MonkeyGain
-git init
+python3 -m unittest discover -s tests -v
+git status
 git add .
-git commit -m "Initial release: MonkeyGain GTK frontend"
-git branch -M main
-git remote add origin https://github.com/TU_USUARIO/MonkeyGain.git
-git push -u origin main
+git commit -m "Release MonkeyGain v0.2.0: expandable library and structured results"
+git push origin main
 ```
 
-Sustituye `TU_USUARIO` por tu usuario real de GitHub. La autenticación con HTTPS puede requerir token o Git Credential Manager; GitHub no admite contraseñas normales al hacer `push` por HTTPS.
+The repository README, comments, interface messages, contributing guide, and changelog are written in **English**. Previous Git commit messages retain their original language unless you explicitly rewrite Git history; history rewriting is neither required nor recommended just to translate a repository.
 
-## Próximas mejoras
+## Roadmap
 
-- Arrastrar y soltar archivos en la ventana.
-- Detalle estructurado de track gain, album gain y true peak.
-- Separación de álbumes por metadatos; gestión de álbumes multidisco.
-- Detección dinámica de formatos al actualizar `rsgain`.
-- Integración con el lanzador de aplicaciones y empaquetado Flatpak / AppCenter.
-- Mejor tratamiento de señales del proceso para cancelaciones forzadas.
+- Drag-and-drop importing and more responsive layouts on narrow windows.
+- Optional metadata-based album grouping for multidisc releases.
+- Persistent scan history, result export to CSV, and an installer / Flatpak build.
+- Detailed validation of the ReplayGain tags after writing, including special Opus conventions.
+- Dynamic file format detection based on the installed rsgain version.
 
-## Licencia
+## License
 
-El **código propio de MonkeyGain** se ofrece bajo licencia MIT (`LICENSE`). `rsgain`, GTK y las demás dependencias conservan sus respectivas licencias. Este proyecto es independiente y no está afiliado a los creadores de `rsgain` ni a elementary OS.
+Original MonkeyGain source code is licensed under the MIT License; see [LICENSE](LICENSE). Third-party components, including rsgain and GTK, retain their own licenses. Not affiliated with the rsgain project or elementary OS.
