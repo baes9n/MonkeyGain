@@ -2,6 +2,40 @@
 
 All notable changes to MonkeyGain are documented here. Versions follow the `MAJOR.MINOR.PATCH` convention.
 
+## [0.3.4] — 2026-10-16
+
+### Improved
+- Replaced the noisy default scanner console with a **live Analysis Activity** feed. It reports scan start, the active album, elapsed time, a heartbeat every 10 seconds while analysis is running, and completion/error summaries.
+- Added a live spinner and elapsed timer beside the activity feed. The animated progress bar remains indeterminate during the active album, with real completed-album counts.
+- Added a **Raw output** toggle for the original rsgain command and TSV measurements; **Export raw** always saves the unmodified technical output, regardless of the selected view.
+- Improved activity readability with distinct status styling for light and dark themes.
+
+### Unchanged
+- Uses a single `rsgain custom --output` pass per album with exactly the same ReplayGain settings and cancel behavior as v0.3.3.
+- No fabricated per-track percentages, no LUFS estimation, no loudness cache, and no "Not stored" labels. Existing tags still load on import, and missing measured LUFS remains `—`.
+- rsgain 3.4 generally publishes TSV track measurements at the end of the album; the live feed reports **real elapsed time and backend state**, not simulated measurements.
+
+## [0.3.3] — 2026-10-16
+
+### Fixed
+- Scans now display an animated activity bar immediately, together with elapsed time and the number of completed albums.
+- The animation is explicitly indeterminate; rsgain 3.4 with `--output` does not expose a live completion percentage.
+- Loudness display is unchanged from v0.3.1: when only existing ReplayGain tags are available, the measured LUFS field remains `—` until a fresh scan is performed.
+
+## [0.3.1] — 2026-10-16
+
+### Fixed
+- Imported files now display existing ReplayGain gain and peak tags without requiring a scan.
+- Tagged, partially tagged, untagged, and unreadable files are distinguished accurately.
+- Existing ReplayGain peak values are converted from linear amplitudes to dB; original peak type is not assumed.
+- Opus R128 gain values are recognized separately from conventional ReplayGain.
+- Added a read-only **Refresh Tags** action for externally changed files.
+
+### Changed
+- Added the `python3-mutagen` dependency for read-only metadata detection.
+- A previous scan measurement takes precedence until **Refresh Tags**, which explicitly loads on-disk values.
+- Existing tag reading occurs in a background worker so the window stays responsive.
+
 ## [0.3.0] — 2026-10-16
 
 ### Added

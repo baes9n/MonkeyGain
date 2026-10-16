@@ -5,13 +5,17 @@ import json
 import os
 from pathlib import Path
 import threading
+import time
 
 import gi
 gi.require_version('Gtk', '4.0')
 from gi.repository import Gio, GLib, Gtk, Gdk, Pango
 
 from . import __version__
+from .activity import ActivityJournal, format_elapsed
 from .desktop import APP_ID
+from .metadata import (ExistingGain, TagRead, common_album_value,
+                       linear_peak_db, load_existing_tags)
 from .core import (
     ScanRunner, ScanSettings, ScanMetric, probe_backend, discover_audio,
     make_album_jobs,
@@ -55,6 +59,17 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self._files: set[Path] = set()
         self._rows: list[dict] = []
         self._results: dict[Path, dict] = {}
+        self._existing_tags: dict[Path, TagRead] = {}
+        self._tag_generation = 0
+        self._scan_wrote_tags = False
+        self._scan_started_at: float | None = None
+        self._scan_active_album: int | None = None
+        self._scan_completed_albums = 0
+        self._scan_cancel_requested = False
+        self._scan_progress_timer: int | None = None
+        self._last_heartbeat_second = 0
+        self._scan_view_active = False
+        self._activity_journal = ActivityJournal()
         self._jobs = []
         self._busy = False
         self._settings = self._read_settings()
@@ -129,9 +144,12 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self.add_folder_button = button('Add Folder', 'folder-open-symbolic', self._choose_folder)
         self.add_file_button = button('Add Files', 'list-add-symbolic', self._choose_files)
         self.clear_button = button('Clear', 'edit-clear-all-symbolic', self._clear)
+        self.refresh_button = button('Refresh Tags', 'view-refresh-symbolic', self._refresh_tags)
+        self.refresh_button.set_sensitive(False)
         header.pack_start(self.add_folder_button)
         header.pack_start(self.add_file_button)
         header.pack_end(self.clear_button)
+        header.pack_end(self.refresh_button)
         root.append(header)
 
         content = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
@@ -174,11 +192,21 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         workspace.append(self.album_scroller)
 
         logs_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        logs_header.append(label('Analysis Log', 'mg-section'))
+        logs_header.append(label('Analysis Activity', 'mg-section'))
         space = Gtk.Box()
         space.set_hexpand(True)
         logs_header.append(space)
-        logs_header.append(button('Export', 'document-save-symbolic', self._export_log))
+        self.activity_spinner = Gtk.Spinner()
+        self.activity_spinner.set_tooltip_text('The analysis process is running')
+        logs_header.append(self.activity_spinner)
+        self.activity_timer_label = label('', 'mg-muted-small')
+        logs_header.append(self.activity_timer_label)
+        self.raw_log_toggle = Gtk.ToggleButton(label='Raw output')
+        self.raw_log_toggle.set_tooltip_text(
+            'Show the original command and complete rsgain output instead of live activity')
+        self.raw_log_toggle.connect('toggled', self._on_log_view_changed)
+        logs_header.append(self.raw_log_toggle)
+        logs_header.append(button('Export raw', 'document-save-symbolic', self._export_log))
         workspace.append(logs_header)
         log_scroll = Gtk.ScrolledWindow()
         log_scroll.set_min_content_height(147)
@@ -194,6 +222,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self.log_view.set_top_margin(10)
         self.log_view.set_bottom_margin(10)
         self.log_view.add_css_class('mg-log')
+        self._create_log_tags()
         log_scroll.set_child(self.log_view)
         workspace.append(log_scroll)
 
@@ -340,6 +369,60 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         container.append(row)
         return control
 
+    def _create_log_tags(self):
+        buffer = self.log_view.get_buffer()
+        for kind in ('info', 'working', 'success', 'warning', 'error'):
+            buffer.create_tag('mg-log-' + kind)
+        self._style_log_tags('dark')
+
+    def _style_log_tags(self, palette: str):
+        dark = palette == 'dark'
+        colors = ({
+            'info': '#aab6cb', 'working': '#a7b8ff',
+            'success': '#91d8b1', 'warning': '#eac184', 'error': '#f5a2a0',
+        } if dark else {
+            'info': '#48546b', 'working': '#465fbc',
+            'success': '#176f4d', 'warning': '#94601c', 'error': '#b33336',
+        })
+        tags = self.log_view.get_buffer().get_tag_table()
+        for kind, color in colors.items():
+            tag = tags.lookup('mg-log-' + kind)
+            if tag is not None:
+                tag.set_property('foreground', color)
+                tag.set_property('weight', 700 if kind in ('success', 'error') else 400)
+
+    def _log_elapsed(self):
+        if self._scan_started_at is None:
+            return None
+        return max(0, int(time.monotonic() - self._scan_started_at))
+
+    def _append_activity(self, level: str, message: str, elapsed: int | None = None):
+        event = self._activity_journal.add(level, message, elapsed)
+        if not self.raw_log_toggle.get_active():
+            self._insert_log_text(event.display(), 'mg-log-' + level)
+        return GLib.SOURCE_REMOVE
+
+    def _insert_log_text(self, message: str, tag_name: str | None = None):
+        buffer = self.log_view.get_buffer()
+        if tag_name:
+            tag = buffer.get_tag_table().lookup(tag_name)
+            if tag is not None:
+                buffer.insert_with_tags(buffer.get_end_iter(), message, tag)
+            else:
+                buffer.insert(buffer.get_end_iter(), message)
+        else:
+            buffer.insert(buffer.get_end_iter(), message)
+        self.log_view.scroll_to_iter(buffer.get_end_iter(), 0, False, 0.0, 0.0)
+
+    def _on_log_view_changed(self, *_args):
+        buffer = self.log_view.get_buffer()
+        buffer.set_text('')
+        if self.raw_log_toggle.get_active():
+            self._insert_log_text(self._activity_journal.raw_text())
+        else:
+            for event in self._activity_journal.events:
+                self._insert_log_text(event.display(), 'mg-log-' + event.level)
+
     def _theme_changed(self, *_args):
         choice = ('system', 'light', 'dark')[self.theme_choice.get_selected()]
         self._set_appearance(choice)
@@ -360,6 +443,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
                 dark = False
         self.add_css_class('mg-dark' if dark else 'mg-light')
         Gtk.Settings.get_default().set_property('gtk-application-prefer-dark-theme', dark)
+        self._style_log_tags('dark' if dark else 'light')
 
     def _refresh_backend(self, *, log_failure: bool = False):
         self.backend = probe_backend(self.backend_entry.get_text())
@@ -463,7 +547,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self._discover([folder.get_path()])
 
     def _discover(self, files: list[str | None]):
-        if self._busy:
+        if self._busy or self._runner.running:
             return
         paths = [path for path in files if path]
         if not paths:
@@ -473,22 +557,40 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self._remember_folder(paths)
         self.status_label.set_text('Searching for supported audio files…')
 
+        generation = self._tag_generation
+
         def task():
             try:
                 result = discover_audio(paths)
-                GLib.idle_add(self._on_discovered, result, '')
+                existing = load_existing_tags(result)
+                GLib.idle_add(self._on_discovered, result, existing, '', generation)
             except Exception as exc:
-                GLib.idle_add(self._on_discovered, [], str(exc))
+                GLib.idle_add(self._on_discovered, [], {}, str(exc), generation)
         threading.Thread(target=task, daemon=True).start()
 
-    def _on_discovered(self, new_files: list[Path], error: str):
+    def _on_discovered(self, new_files: list[Path], existing: dict[Path, TagRead],
+                       error: str, generation: int):
+        if generation != self._tag_generation:
+            return GLib.SOURCE_REMOVE
         self._busy = False
         self._set_import_sensitive(True)
         if error:
             self._append_log(f'Import error: {error}\n')
         old = len(self._files)
         self._files.update(new_files)
-        self.status_label.set_text(f'{len(self._files) - old} new files added')
+        self._existing_tags.update(existing)
+        tagged = sum(1 for tag in existing.values() if tag.info.tagged)
+        failures = [f'{path.name}: {tag.error}' for path, tag in existing.items() if tag.error]
+        self.status_label.set_text(
+            f'{len(self._files) - old} new files added · {tagged} with existing gain tags'
+        )
+        if failures:
+            self._append_log(
+                f'Metadata could not be read from {len(failures)} files. '
+                'Unverified files are not treated as untagged.\n'
+            )
+            for failure in failures[:5]:
+                self._append_log(f'  {failure}\n')
         if not new_files:
             self._append_log('No supported audio files were found.\n')
         self._update_collection()
@@ -497,8 +599,10 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
     def _clear(self, *_args):
         if self._runner.running or self._busy:
             return
+        self._tag_generation += 1
         self._files.clear()
         self._results.clear()
+        self._existing_tags.clear()
         self._update_collection()
         self.status_label.set_text('Queue cleared')
 
@@ -632,34 +736,121 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
                 track_row.append(value)
                 values[key] = value
             details.append(track_row)
-            track_widgets[file.name] = {'values': values, 'row': track_row}
+            track_widgets[file.name] = {'values': values, 'row': track_row, 'title': name, 'file': file}
         self.album_list.append(item)
         return {
             'status': status, 'icon': status_icon, 'revealer': revealer,
             'toggle': toggle, 'stat_values': stat_values,
-            'tracks': track_widgets, 'folder': job.folder,
+            'tracks': track_widgets, 'folder': job.folder, 'files': job.files,
         }
 
+    def _tag_status(self, row: dict) -> None:
+        readings = [self._existing_tags.get(path) for path in row['files']]
+        tagged = sum(bool(info and info.info.tagged) for info in readings)
+        unknown = sum(bool(info and info.error) for info in readings)
+        count = len(readings)
+        if tagged == count and count:
+            caption = 'Already tagged'
+        elif tagged:
+            caption = f'{tagged}/{count} tagged'
+        elif unknown:
+            caption = 'Tags unknown' if unknown == count else 'Partly unknown'
+        else:
+            caption = 'Not tagged'
+        row['status'].set_text(caption)
+        row['status'].set_tooltip_text(
+            f'{tagged} files contain recognized ReplayGain/R128 tags, '
+            f'{unknown} could not be inspected, {count - tagged - unknown} untagged.'
+        )
+        row['icon'].set_visible(bool(tagged))
+
     def _apply_metrics(self, row: dict, result: dict) -> None:
+        """Fresh scan measurements take priority over stored metadata.
+
+        Existing ReplayGain tags do not contain a measured LUFS figure or
+        enough information to label peaks as true peaks: never invent either.
+        """
         album: ScanMetric | None = result.get('album')
         stats = row['stat_values']
-        stats['gain'].set_text(self._fmt_number(album.gain, 'dB', signed=True) if album else '—')
-        stats['loudness'].set_text(self._fmt_number(album.loudness, 'LUFS') if album else '—')
-        stats['peak'].set_text(self._fmt_number(album.peak_db, 'dBTP' if album.peak_type == 'True' else 'dBFS') if album else '—')
+        readings = [self._existing_tags.get(path, TagRead()).info for path in row['files']]
+        album_gain, gain_mixed = common_album_value(tag.album_gain for tag in readings)
+        album_peak, peak_mixed = common_album_value(tag.album_peak for tag in readings)
+        album_r128, r128_mixed = common_album_value(tag.r128_album_gain for tag in readings)
+        for item in stats.values():
+            item.set_tooltip_text(None)
+        if album:
+            stats['gain'].set_text(self._fmt_number(album.gain, 'dB', signed=True))
+            stats['loudness'].set_text(self._fmt_number(album.loudness, 'LUFS'))
+            stats['peak'].set_text(self._fmt_number(album.peak_db,
+                'dBTP' if album.peak_type == 'True' else 'dBFS'))
+            for item in stats.values():
+                item.set_tooltip_text('Measured in the current scan')
+        else:
+            if gain_mixed or (r128_mixed and album_gain is None):
+                stats['gain'].set_text('Mixed')
+                stats['gain'].set_tooltip_text('Files contain conflicting album gain tags')
+            elif album_gain is not None:
+                stats['gain'].set_text(self._fmt_number(album_gain, 'dB', signed=True))
+                stats['gain'].set_tooltip_text('Existing REPLAYGAIN_ALBUM_GAIN tag (not a new scan)')
+            elif album_r128 is not None:
+                stats['gain'].set_text(self._fmt_number(album_r128, 'dB', signed=True))
+                stats['gain'].set_tooltip_text('Existing Opus R128 album gain; reference -23 LUFS, not ReplayGain target')
+            else:
+                stats['gain'].set_text('—')
+            stats['loudness'].set_text('—')
+            stats['loudness'].set_tooltip_text('Integrated LUFS is not stored in standard ReplayGain tags; run a scan to measure it')
+            if peak_mixed:
+                stats['peak'].set_text('Mixed')
+                stats['peak'].set_tooltip_text('Files contain conflicting album peak tags')
+            elif album_peak is not None:
+                stats['peak'].set_text(self._fmt_number(linear_peak_db(album_peak), 'dB'))
+                stats['peak'].set_tooltip_text('Existing ReplayGain album peak; true/sample peak type is unknown')
+            else:
+                stats['peak'].set_text('—')
+
         for name, item in row['tracks'].items():
             metric: ScanMetric | None = result.get('tracks', {}).get(name)
+            reading = self._existing_tags.get(item['file'], TagRead())
+            tag = reading.info
             values = item['values']
-            values['loudness'].set_text(self._fmt_number(metric.loudness) if metric else '—')
-            values['gain'].set_text(self._fmt_number(metric.gain, 'dB', signed=True) if metric else '—')
-            values['peak'].set_text(self._fmt_number(metric.peak_db, 'dB') if metric else '—')
+            item['title'].set_text(('✓  ' if tag.tagged else '') + item['file'].stem)
+            item['title'].set_tooltip_text(
+                f'{item["file"].name}\nExisting gain tags detected' if tag.tagged
+                else (f'{item["file"].name}\nTag read error: {reading.error}' if reading.error
+                      else f'{item["file"].name}\nNo existing gain tags detected')
+            )
+            if tag.tagged:
+                item['title'].add_css_class('mg-tagged-name')
+            else:
+                item['title'].remove_css_class('mg-tagged-name')
+            values['gain'].remove_css_class('mg-adjusted')
+            for value in values.values():
+                value.set_tooltip_text(None)
             if metric:
-                values['peak'].set_tooltip_text(f'{metric.peak_type} peak: {metric.peak:.6f} linear')
+                values['loudness'].set_text(self._fmt_number(metric.loudness))
+                values['gain'].set_text(self._fmt_number(metric.gain, 'dB', signed=True))
+                values['peak'].set_text(self._fmt_number(metric.peak_db, 'dB'))
+                values['peak'].set_tooltip_text(f'{metric.peak_type} peak: {metric.peak:.6f} linear, current scan')
                 if metric.clipping_adjusted:
                     values['gain'].set_tooltip_text('Gain reduced to prevent clipping')
                     values['gain'].add_css_class('mg-adjusted')
+            else:
+                values['loudness'].set_text('—')
+                values['loudness'].set_tooltip_text('Run a scan to measure loudness; LUFS is not in ReplayGain tags')
+                gain = tag.track_gain if tag.track_gain is not None else tag.r128_track_gain
+                values['gain'].set_text(self._fmt_number(gain, 'dB', signed=True) if gain is not None else '—')
+                if tag.track_gain is not None:
+                    values['gain'].set_tooltip_text('Existing REPLAYGAIN_TRACK_GAIN tag (not a new scan)')
+                elif tag.r128_track_gain is not None:
+                    values['gain'].set_tooltip_text('Existing Opus R128 track gain, reference -23 LUFS; not a ReplayGain -18 LUFS result')
+                values['peak'].set_text(self._fmt_number(linear_peak_db(tag.track_peak), 'dB')
+                                        if tag.track_peak is not None else '—')
+                if tag.track_peak is not None:
+                    values['peak'].set_tooltip_text('Existing linear ReplayGain peak converted to dB; sample/true peak type unknown')
 
     def _update_collection(self):
         self._jobs = make_album_jobs(self._files)
+        self.refresh_button.set_sensitive(bool(self._files) and not self._busy and not self._runner.running)
         self._rows.clear()
         while row := self.album_list.get_row_at_index(0):
             self.album_list.remove(row)
@@ -668,6 +859,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         for position, job in enumerate(self._jobs):
             row = self._make_album_row(job, position)
             self._apply_metrics(row, self._results.get(job.folder, {}))
+            self._tag_status(row)
             self._rows.append(row)
         if not self._runner.running:
             self.progress.set_fraction(0)
@@ -739,14 +931,35 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
 
     def _start(self, config: ScanSettings):
         self._save_settings()
+        self._scan_wrote_tags = config.write_tags
+        self._activity_journal.clear()
+        # Each run opens with the friendly live view, never a wall of TSV rows.
+        self._scan_view_active = True
+        self.raw_log_toggle.set_active(False)
         self.log_view.get_buffer().set_text('')
+        self._append_activity('info',
+            f'Started scan queue · {self._plural(len(self._jobs), "album")} · '
+            f'{self._plural(sum(len(job.files) for job in self._jobs), "track")}', 0)
+        self._append_activity('info',
+            'Writing ReplayGain tags' if config.write_tags else 'Read-only analysis · no tags will be written', 0)
         self._results.clear()
         self._update_collection()
         for row in self._rows:
             row['status'].set_text('Queued')
             row['icon'].set_visible(False)
         self.progress.set_fraction(0)
-        self.progress.set_text('0% · albums')
+        self.progress.set_text(f'0/{len(self._jobs)} albums · 0:00')
+        self._scan_started_at = time.monotonic()
+        self._scan_active_album = None
+        self._scan_completed_albums = 0
+        self._scan_cancel_requested = False
+        self._last_heartbeat_second = 0
+        self.activity_timer_label.set_text('0:00 elapsed')
+        self.activity_spinner.start()
+        if self._scan_progress_timer is not None:
+            GLib.source_remove(self._scan_progress_timer)
+        self._scan_progress_timer = GLib.timeout_add(125, self._tick_scan_progress)
+        self.progress.pulse()
         self.run_button.set_sensitive(False)
         self.cancel_button.set_sensitive(True)
         self._set_import_sensitive(False)
@@ -766,6 +979,39 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self.add_folder_button.set_sensitive(active)
         self.add_file_button.set_sensitive(active)
         self.clear_button.set_sensitive(active)
+        self.refresh_button.set_sensitive(active and bool(self._files))
+
+    def _tick_scan_progress(self):
+        """Keep an indeterminate progress indicator moving while rsgain scans.
+
+        rsgain 3.4 --output does not provide trustworthy per-track percent
+        updates. Only completed album counts are treated as actual progress.
+        """
+        if self._scan_started_at is None:
+            self._scan_progress_timer = None
+            return GLib.SOURCE_REMOVE
+        elapsed_seconds = max(0, int(time.monotonic() - self._scan_started_at))
+        elapsed = format_elapsed(elapsed_seconds)
+        self.activity_timer_label.set_text(f'{elapsed} elapsed')
+        # A heartbeat represents elapsed time, never a guessed track percentage.
+        # Keep the feed alive even if rsgain buffers TSV results until the end.
+        if (elapsed_seconds >= self._last_heartbeat_second + 10
+                and self._scan_active_album is not None and not self._scan_cancel_requested):
+            self._last_heartbeat_second = elapsed_seconds
+            album = self._jobs[self._scan_active_album]
+            self._append_activity('working',
+                f'Analyzing {album.label} · still running', elapsed_seconds)
+        total = len(self._jobs)
+        self.progress.set_text(f'{self._scan_completed_albums}/{total} albums · {elapsed}')
+        # Pulse even while the first subprocess starts, and while one album
+        # finishes before the next begins. This indicates activity, not a %.
+        self.progress.pulse()
+        if self._scan_active_album is not None and not self._scan_cancel_requested:
+            i = self._scan_active_album
+            self.status_label.set_text(
+                f'Scanning album {i + 1}/{total}: {self._jobs[i].label} · {elapsed} elapsed'
+            )
+        return GLib.SOURCE_CONTINUE
 
     def _on_job(self, index: int, status: str):
         mapping = {
@@ -782,17 +1028,48 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         row['icon'].set_from_icon_name(icon_name)
         row['icon'].set_visible(True)
         if status == 'running':
+            self._scan_active_album = index
             row['toggle'].set_active(True)
             self.status_label.set_text(f'Scanning album {index + 1}/{len(self._rows)}: {self._jobs[index].label}')
+            self._append_activity('working',
+                f'Analyzing album {index + 1}/{len(self._jobs)} · {self._jobs[index].label} '
+                f'({self._plural(len(self._jobs[index].files), "track")})', self._log_elapsed())
         else:
+            self._scan_active_album = None
+            if status == 'success':
+                result = self._results.get(self._jobs[index].folder, {})
+                album = result.get('album')
+                extra = (f' · {album.loudness:.2f} LUFS · '
+                         f'{album.gain:+.2f} dB Album Gain') if album else ''
+                num_metrics = len(result.get('tracks', {}))
+                details = (f'{self._plural(num_metrics, "track")} reported' if num_metrics
+                           else 'no track results in output')
+                self._append_activity('success',
+                    f'Completed {self._jobs[index].label} · {details}{extra}',
+                    self._log_elapsed())
+            elif status == 'failed':
+                self._append_activity('error',
+                    f'Failed to analyze {self._jobs[index].label} · see Raw output', self._log_elapsed())
+            elif status == 'cancelled':
+                self._append_activity('warning',
+                    f'Cancelled {self._jobs[index].label}', self._log_elapsed())
             for item in row['tracks'].values():
                 item['row'].remove_css_class('mg-active-track')
             done = sum(x['status'].get_text() in ('Completed', 'Failed', 'Cancelled') for x in self._rows)
+            self._scan_completed_albums = done
             self.progress.set_fraction(done / len(self._rows))
             self.progress.set_text(f'{done}/{len(self._rows)} albums')
         return GLib.SOURCE_REMOVE
 
     def _on_finished(self, success: int, errors: int, cancelled: bool):
+        elapsed_final = self._log_elapsed()
+        self._scan_started_at = None
+        self.activity_spinner.stop()
+        self.activity_timer_label.set_text(f'{format_elapsed(elapsed_final or 0)} total')
+        self._scan_active_album = None
+        if self._scan_progress_timer is not None:
+            GLib.source_remove(self._scan_progress_timer)
+            self._scan_progress_timer = None
         self.config_box.set_sensitive(True)
         for control in (self.album_switch, self.true_peak_switch, self.write_switch, self.skip_switch,
                         self.theme_choice, self.notify_switch, self.clip_choice,
@@ -811,7 +1088,12 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             self.progress.set_fraction(1)
             self.progress.set_text('Scan finished')
         self.status_label.set_text(message)
+        self._append_activity('warning' if cancelled else ('error' if errors else 'success'),
+                              message, elapsed_final)
         self._append_log(f'\n{message}\n')
+        self._scan_view_active = False
+        if self._scan_wrote_tags:
+            self._reload_existing_tags()
         if self.notify_switch.get_active():
             try:
                 notice = Gio.Notification.new('MonkeyGain scan finished' if not cancelled
@@ -822,16 +1104,73 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
                 self._append_log(f'Notification unavailable: {exc}\n')
         return GLib.SOURCE_REMOVE
 
+    def _refresh_tags(self, *_args):
+        """Manually reload tags, without running rsgain or writing audio."""
+        if self._runner.running or self._busy or not self._files:
+            return
+        self._busy = True
+        self._set_import_sensitive(False)
+        self.run_button.set_sensitive(False)
+        self.status_label.set_text('Reading existing ReplayGain tags…')
+        self._reload_existing_tags(manual=True)
+
+    def _reload_existing_tags(self, *, manual: bool = False) -> None:
+        """Read metadata in a worker to avoid blocking the GTK main loop."""
+        files = tuple(self._files)
+        generation = self._tag_generation
+
+        def task():
+            readings = load_existing_tags(files)
+            GLib.idle_add(self._on_tags_reloaded, readings, generation, manual)
+        threading.Thread(target=task, daemon=True).start()
+
+    def _on_tags_reloaded(self, readings: dict[Path, TagRead], generation: int,
+                          manual: bool):
+        if generation != self._tag_generation:
+            return GLib.SOURCE_REMOVE
+        self._existing_tags.update(readings)
+        if manual:
+            # A manual refresh explicitly requests the on-disk values, not
+            # measurements from a prior scan that might now be stale.
+            self._results.clear()
+        for row in self._rows:
+            self._apply_metrics(row, self._results.get(row['folder'], {}))
+            if manual:
+                self._tag_status(row)
+        tagged = sum(1 for path in self._files
+                     if self._existing_tags.get(path, TagRead()).info.tagged)
+        unknown = sum(1 for path in self._files
+                      if self._existing_tags.get(path, TagRead()).error)
+        self._append_log(f'Existing gain tags found in {tagged}/{len(self._files)} tracks'
+                         f' ({unknown} unreadable).\n')
+        if manual:
+            self._busy = False
+            self._set_import_sensitive(True)
+            self.run_button.set_sensitive(bool(self._jobs) and bool(self.backend.path))
+            self.status_label.set_text(f'{tagged} tracks with existing gain tags · '
+                                       f'{unknown} unreadable')
+        return GLib.SOURCE_REMOVE
+
     def _cancel(self, *_args):
+        self._scan_cancel_requested = True
         self.status_label.set_text('Cancelling scan…')
+        self._append_activity('warning', 'Cancellation requested · waiting for rsgain to stop',
+                              self._log_elapsed())
         self._runner.cancel()
         self.cancel_button.set_sensitive(False)
 
     def _append_log(self, message: str):
-        buffer = self.log_view.get_buffer()
-        buffer.insert(buffer.get_end_iter(), message)
-        end = buffer.get_end_iter()
-        self.log_view.scroll_to_iter(end, 0, False, 0.0, 0.0)
+        """Keep full unmodified backend output, but display friendly live events."""
+        self._activity_journal.add_raw(message)
+        if self.raw_log_toggle.get_active():
+            self._insert_log_text(message)
+        elif not self._scan_view_active:
+            # Diagnostics before and after scans should never disappear.
+            if message.strip():
+                self._append_activity('info', message.rstrip('\n'), None)
+        elif ('error:' in message.lower() or 'failed to ' in message.lower()):
+            # Show unexpected scanner errors right away, preserving the raw log.
+            self._append_activity('error', message.strip(), self._log_elapsed())
         return GLib.SOURCE_REMOVE
 
     def _export_log(self, *_args):
@@ -846,9 +1185,8 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             path = file.get_path()
             if not path:
                 raise OSError('Choose a local destination.')
-            buffer = self.log_view.get_buffer()
-            text = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True)
-            Path(path).write_text(text, encoding='utf-8')
+            # Always export all diagnostics, even while the Activity view is selected.
+            Path(path).write_text(self._activity_journal.raw_text(), encoding='utf-8')
             self.status_label.set_text('Log exported successfully')
         except GLib.Error:
             return

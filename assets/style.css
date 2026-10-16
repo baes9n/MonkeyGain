@@ -61,3 +61,7 @@ window.mg-light { background-color: #f5f7fa; color: #202633; }
 /* 0.3.0: highlight the library when importing via drag and drop. */
 .mg-drop-active .mg-card { border: 2px dashed #8499ff; }
 .mg-drop-active .mg-album-list { background-color: alpha(#8499ff, 0.07); }
+
+/* 0.3.1: highlight files with already-existing ReplayGain tags. */
+.mg-dark .mg-tagged-name { color: #93d7b5; }
+.mg-light .mg-tagged-name { color: #137751; }
