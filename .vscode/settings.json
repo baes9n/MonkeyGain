@@ -1,0 +1,5 @@
+{
+  "python.defaultInterpreterPath": "/usr/bin/python3",
+  "python.analysis.extraPaths": ["${workspaceFolder}"],
+  "files.exclude": { "**/__pycache__": true, "**/*.pyc": true }
+}

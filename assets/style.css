@@ -1,0 +1,36 @@
+/* GTK 4 styling; both palettes retain legible foreground/background contrast. */
+window.mg-dark { background-color: #151820; color: #ecf0f8; }
+window.mg-light { background-color: #f5f7fa; color: #202633; }
+.mg-dark .mg-header { background: #1e232e; border-bottom: 1px solid #303848; }
+.mg-light .mg-header { background: #ffffff; border-bottom: 1px solid #dee3eb; }
+.mg-brand { font-size: 18px; font-weight: 750; }
+.mg-title { font-size: 21px; font-weight: 730; }
+.mg-section { font-size: 14px; font-weight: 700; }
+.mg-field-label, .mg-album-title { font-size: 13px; font-weight: 650; }
+.mg-description { font-size: 12px; opacity: .73; }
+.mg-muted-small { font-size: 11px; opacity: .64; }
+.mg-muted { opacity: .55; }
+.mg-hint { font-size: 12px; opacity: .65; }
+.mg-count { font-size: 12px; font-weight: 700; }
+.mg-status { font-size: 11px; opacity: .8; }
+.mg-dark .mg-count { color: #b6c6ff; }
+.mg-light .mg-count { color: #465db7; }
+.mg-ok { color: #44b887; }
+.mg-error { color: #d66f6f; }
+.mg-card { border-radius: 14px; }
+.mg-dark .mg-card { background: #202530; border: 1px solid #323949; }
+.mg-light .mg-card { background: #fff; border: 1px solid #dfe5ee; }
+.mg-dark .mg-album-list { background: transparent; }
+.mg-light .mg-album-list { background: transparent; }
+.mg-album-row { border-bottom: 1px solid alpha(currentColor,.10); background: transparent; }
+.mg-album-row:last-child { border-bottom: none; }
+.mg-dark .mg-sidebar { border-left: 1px solid #303848; background: #1b1f28; }
+.mg-light .mg-sidebar { border-left: 1px solid #e0e5ed; background: #ffffff; }
+.mg-dark .mg-footer { border-top: 1px solid #303848; }
+.mg-light .mg-footer { border-top: 1px solid #e1e5eb; }
+.mg-primary { border-radius: 9px; background: #687cf1; background-image: none; color: #ffffff; font-weight: 700; padding: 9px 15px; }
+.mg-primary:hover { background: #778afb; }
+.mg-primary:disabled { opacity: .45; }
+.mg-log-card { border-radius: 12px; }
+.mg-dark .mg-log-card, .mg-dark textview.mg-log, .mg-dark textview.mg-log text { background: #11141b; color: #cfd8e7; }
+.mg-light .mg-log-card, .mg-light textview.mg-log, .mg-light textview.mg-log text { background: #e9edf3; color: #2f3845; }
