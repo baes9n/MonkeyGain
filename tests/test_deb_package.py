@@ -13,7 +13,7 @@ from build_deb import APP_ID, SIZES, build, read_version, stage
 
 class TestDebPackaging(unittest.TestCase):
     def test_version_matches_source(self):
-        self.assertEqual(read_version(ROOT), '0.5.5')
+        self.assertEqual(read_version(ROOT), '0.6.3')
 
     def test_staging_has_icons_dependencies_and_independent_launcher(self):
         with tempfile.TemporaryDirectory() as td:
@@ -37,7 +37,7 @@ class TestDebPackaging(unittest.TestCase):
             self.assertIn('Architecture: all', control)
             self.assertIn('rsgain (>= 3.4)', control)
             self.assertIn('python3-mutagen', control)
-            self.assertIn('Version: 0.5.5', control)
+            self.assertIn('Version: 0.6.3', control)
             self.assertTrue((root / 'usr/share/doc/monkeygain/copyright').is_file())
 
     @unittest.skipUnless(shutil.which('dpkg-deb'), 'dpkg-deb unavailable')
@@ -48,7 +48,7 @@ class TestDebPackaging(unittest.TestCase):
             info = subprocess.check_output(['dpkg-deb', '--field', str(path),
                                             'Package', 'Version', 'Architecture'], text=True)
             self.assertIn('monkeygain', info)
-            self.assertIn('0.5.5', info)
+            self.assertIn('0.6.3', info)
             self.assertIn('all', info)
             listing = subprocess.check_output(['dpkg-deb', '--contents', str(path)], text=True)
             self.assertIn('usr/bin/monkeygain', listing)

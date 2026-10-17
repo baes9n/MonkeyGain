@@ -4,11 +4,15 @@
 
 **MonkeyGain** is a lightweight, native GTK 4 desktop application for scanning music with [rsgain](https://github.com/complexlogic/rsgain). Inspired by the simplicity of elementary OS, it offers a compact scan queue with album selection and real ReplayGain analysis results without re-encoding audio.
 
-**Current version: 0.5.5 — release preparation preview.** The Python core is covered by automated tests. The GTK UI should be tested on an actual Linux desktop before relying on it for valuable music. **Back up your files before enabling tag writing.**
+**Current version: 0.6.3 — restored reliable album list.** The Python core is covered by automated tests. The GTK UI should be tested on an actual Linux desktop before relying on it for valuable music. **Back up your files before enabling tag writing.**
 
 ## Features
 
 - Native GTK 4 layout with **Dark**, **Light**, and **System** appearance modes.
+- **Simplified album rows** with compact details controls, clearer keyboard focus and a narrower options panel.
+- **Compact search and selection toolbar**: keep album searching and tag filtering visible; use the Selection menu for Select Matches / Clear Selection.
+- **Contextual activity**: import and scan progress appears only while operations are active, and the completion summary remains visible without a full progress bar.
+- **Keyboard shortcuts**: Ctrl+O files, Ctrl+Shift+O folders, Ctrl+F search, Ctrl+R refresh tags, Ctrl+Enter scan selected, Ctrl+Shift+Enter scan all; Esc clears the focused search field. Album rows can be expanded with keyboard activation.
 - Drag and drop audio files or folders into the window, or open supported files via the desktop launcher.
 - Remembers the most recently imported folder for subsequent file dialogs.
 - Optional desktop notification when each scan queue finishes.
@@ -16,9 +20,10 @@
 - **Responsive large imports**: folder discovery and ReplayGain-tag inspection run away from the GTK main thread. Discovery displays a busy indicator and a live discovered-file count; metadata inspection displays actual processed/total file progress.
 - The **Cancel** button in the shared footer stops an import safely; already inspected files stay in the import queue.
 - **Bounded scan queue**: shows at most 40 compact album rows per page, instead of constructing the whole collection at once. Previous/Next and filters help locate albums and select them for scanning. This uses pagination, not complete GTK ListView virtualization.
+- **Stable album position**: opening a track list remembers the current scroll position; closing it returns to that position without a height animation or stealing mouse focus.
 - **Lazy track details**: albums initially appear collapsed. The most recently analyzed album is expanded automatically when auto-follow is active. Use **View results** (list icon, not playback) on any other album, loading up to 60 track rows; use Show next tracks for unusually large albums.
 - **Expandable compact album rows** with track names and formats, without artwork decoding or thumbnail caching. Search matches album names, artist folder names and track names.
-- **Multi-album selection** with checkboxes, **Select Matches** (across all matching pages), and **Clear Selection**. Selection is retained while changing pages and filters.
+- **Multi-album selection** with checkboxes, the **Selection** menu containing **Select Matches** (across all matching pages) and **Clear Selection**. Selection is retained while changing pages and filters.
 - **Scan Selected** processes exactly the checked albums; **Scan All** processes all imported albums regardless of search and filters. The confirmation for writing tags states the actual number of files to be modified.
 - Album cards retain their expanded/collapsed state when the library refreshes.
 - **Existing metadata detection**: automatically reads already-written ReplayGain tags when importing audio, without launching an analysis or modifying any file. Shows "Already tagged", "Not tagged", "Partly tagged", or "Tags unknown" where appropriate.
@@ -106,7 +111,7 @@ This is a **per-user source-based launcher**, not the separately built Debian pa
 ## How to use MonkeyGain
 
 1. Choose **Add Folder** or **Add Files**, or drag audio files and folders onto the application window. Folders are scanned recursively **in the background**. The shared footer progress bar shows discovery and metadata-reading progress, and **Cancel** stops new work while retaining batches already loaded. Importing does **not change your audio**.
-2. Navigate with **Previous/Next**, search by album/artist/track, or filter by tag status. Click the checkbox beside any album you want to analyze. **Select Matches** adds every album currently matching the search and status filter, including other pages. **Clear Selection** deselects all albums. Use **Show tracks** (or **View results** after a scan) to expand track details. When a scan finishes, the most recently analyzed album expands automatically if auto-follow is still active. Use **Refresh Tags** after editing tags in another application.
+2. Navigate with **Previous/Next**, search by album/artist/track, or filter by tag status. Click the checkbox beside any album you want to analyze. **Selection → Select Matches** adds every album currently matching the search and status filter, including other pages. **Selection → Clear Selection** deselects all albums. Use **Show tracks** (or **View results** after a scan) to expand track details. When a scan finishes, the most recently analyzed album expands automatically if auto-follow is still active. Use **Refresh Tags** after editing tags in another application.
 3. Review the **Settings** panel; the default profile matches:
 
    ```bash
@@ -176,7 +181,7 @@ Build from the repository, without administrator privileges:
 cd /data/Projects/MonkeyGain
 python3 -m unittest discover -s tests -v
 python3 scripts/build_deb.py
-# Output: dist/monkeygain_0.5.5_all.deb
+# Output: dist/monkeygain_0.6.3_all.deb
 ```
 
 **If you previously used the per-user desktop installer** (`install_local.py`),
@@ -186,7 +191,7 @@ and opens the development copy instead of the `.deb` installation:
 
 ```bash
 python3 scripts/install_local.py --uninstall
-sudo apt install ./dist/monkeygain_0.5.5_all.deb
+sudo apt install ./dist/monkeygain_0.6.3_all.deb
 ```
 
 You can then launch `MonkeyGain` from the Applications menu or run
@@ -287,7 +292,7 @@ cd /data/Projects/MonkeyGain
 python3 -m unittest discover -s tests -v
 git status
 git add .
-git commit -m "Prepare MonkeyGain v0.5.5 release"
+git commit -m "Refine MonkeyGain v0.6.3 interface"
 git push origin main
 ```
 
@@ -295,7 +300,7 @@ The repository README, comments, interface messages, contributing guide, and cha
 
 ## Roadmap
 
-- Improved layouts for narrow windows and keyboard accessibility.
+- More manual GTK accessibility testing with assistive technologies and narrow windows.
 - Optional metadata-based album grouping for multidisc releases.
 - Persistent scan history, result export to CSV, and Flatpak distribution.
 - Broader metadata support for less common tag containers, with stronger post-write verification.

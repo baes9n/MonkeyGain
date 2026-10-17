@@ -17,7 +17,7 @@ class TestRelease(unittest.TestCase):
     def test_new_package_verifies_without_installing(self):
         with tempfile.TemporaryDirectory() as td:
             deb = build(ROOT, Path(td))
-            self.assertEqual(verify(deb), '0.5.5')
+            self.assertEqual(verify(deb), '0.6.3')
 
     def test_bad_or_missing_package_is_rejected(self):
         with tempfile.TemporaryDirectory() as td:

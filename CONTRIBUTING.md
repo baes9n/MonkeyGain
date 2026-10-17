@@ -25,7 +25,7 @@ We target Python 3.12+, GTK 4, and rsgain 3.4 or newer. Linux packages supply Py
 
 Each pull request is validated by the GitHub Actions Linux test and packaging
 workflow. For changes to Debian packaging, run
-`python3 scripts/verify_release.py dist/monkeygain_0.5.5_all.deb` after
+`python3 scripts/verify_release.py dist/monkeygain_0.6.1_all.deb` after
 building locally. See [docs/RELEASING.md](docs/RELEASING.md) before creating
 a release tag or uploading binary packages.
 

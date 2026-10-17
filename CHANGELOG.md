@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.6.3] — 2026-10-16
+
+### Fixed
+- Restored the stable v0.5.5 album-list and track disclosure behavior rather than the experimental scrolling and height manipulation introduced later.
+- Removed delayed scroll-restoration callbacks that could produce giant blank expanded rows and unexpected viewport jumps.
+- Kept a clear selected-row highlight without affecting the dimensions of any album.
+- Preserved the current ReplayGain backend, package dependencies, scan selection, keyboard shortcuts and contextual progress indicator.
+
+## [0.6.2] — 2026-10-16
+
+### Fixed
+- Album disclosure no longer uses an animated height transition that could displace the scroll position.
+- When collapsing a track list, restore the position saved just before that album was expanded; ignore delayed callbacks after navigation or re-expansion.
+- Clicking View results / Hide results no longer steals focus and triggers unintended GTK auto-scrolling.
+- Kept the high-contrast album selection style, detailed scan results, paging and all ReplayGain processing unchanged.
+
+### Validation
+- Added regression checks for collapsing, rapid toggle actions and viewport restoration. Confirm visually in elementary OS with albums of different sizes.
+
+## [0.6.1] — 2026-10-16
+
+### Fixed
+- Prepare per-track GTK widgets before opening an album to prevent a sudden layout jump.
+- Increase GTK Revealer slide duration to 280 ms and keep fast open/close interactions consistent.
+- Make album selection unambiguous in dark and light themes using a tinted row, a four-pixel accent, a visible **Selected** badge, and more distinct checkbox colors.
+- Preserve existing pagination, scroll-follow rules, selected scan targets, tag metadata, and replaygain calculations.
+
+### Notes
+- GTK honors the system's reduced-animation settings. Transitions should be verified on elementary OS with both themes and collections of varying sizes.
+
+## [0.6.0] — 2026-10-16
+
+### Changed
+- Refined the compact album queue: album titles are emphasized, redundant decorative icons are removed, and View results / Show tracks now sits with each album's status.
+- Grouped bulk selection actions inside a single **Selection** menu while keeping search, tag filters and the selected-album count accessible.
+- Reduced the options panel's minimum width and tightened spacing to leave more room for album and per-track results.
+- Hid the progress bar and Cancel button after imports and scans finish. A concise completion status remains visible; only one progress area is used during active operations.
+- Added keyboard shortcuts for imports, search, tag refresh and scan actions, along with keyboard activation of album rows and visible focus styling.
+
+### Preserved
+- No changes to the rsgain command, album grouping, tag reading/writing, metric parsing, paginated imports, scan selection semantics or official MonkeyGain icon.
+- No artwork, console, diagnostics picker or unrelated new features.
+
+### Validation
+- Added headless regression tests for the progress lifecycle, compact queue and keyboard shortcuts. These are not a substitute for visual and assistive-technology testing on a real GTK desktop.
+
 ## [0.5.5] — 2026-10-16
 
 - Added GitHub Actions tests and Debian package builds for pushes, pull requests and release tags.

@@ -85,3 +85,19 @@ window.mg-light { background-color: #f5f7fa; color: #202633; }
 .mg-scan-focus { border-left: 3px solid #879bff; }
 .mg-dark .mg-scan-focus { background-color: alpha(#8194ff, 0.11); }
 .mg-light .mg-scan-focus { background-color: alpha(#556edf, 0.08); }
+
+/* Selected albums remain clearly visible in both themes without altering layout. */
+.mg-dark row.mg-album-row.mg-selected-album,
+.mg-dark row.mg-album-row.mg-selected-album:hover {
+    background-color: #344263;
+    box-shadow: inset 4px 0 #a6b4ff;
+}
+.mg-light row.mg-album-row.mg-selected-album,
+.mg-light row.mg-album-row.mg-selected-album:hover {
+    background-color: #dfe8ff;
+    box-shadow: inset 4px 0 #475dc3;
+}
+.mg-dark .mg-selected-album .mg-album-title { color: #ffffff; }
+.mg-light .mg-selected-album .mg-album-title { color: #192f72; }
+.mg-dark .mg-album-checkbox check:checked { background-color: #93a5fa; color: #0c1833; border-color: #93a5fa; }
+.mg-light .mg-album-checkbox check:checked { background-color: #435ac3; color: white; border-color: #435ac3; }

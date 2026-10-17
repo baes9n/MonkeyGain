@@ -23,15 +23,15 @@ On elementary OS / Ubuntu with `dpkg-deb` installed:
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q monkeygain scripts run.py
 python3 scripts/build_deb.py --output-dir dist
-python3 scripts/verify_release.py dist/monkeygain_0.5.5_all.deb
-(cd dist && sha256sum monkeygain_0.5.5_all.deb > SHA256SUMS)
+python3 scripts/verify_release.py dist/monkeygain_0.6.3_all.deb
+(cd dist && sha256sum monkeygain_0.6.3_all.deb > SHA256SUMS)
 ```
 
 Check that the `.deb` installs and the application starts on a real desktop.
 For package upgrades on Debian/Ubuntu, use:
 
 ```bash
-sudo apt install ./dist/monkeygain_0.5.5_all.deb
+sudo apt install ./dist/monkeygain_0.6.3_all.deb
 ```
 
 Never verify tag writing against your only copies of music. `apt remove
@@ -44,7 +44,7 @@ or user preferences.
 git status
 git add -A
 git diff --cached --check
-git commit -m "Prepare MonkeyGain v0.5.5 release"
+git commit -m "Refine MonkeyGain v0.6.3 interface"
 git push origin main
 ```
 
@@ -55,11 +55,11 @@ run contains a `.deb` and `SHA256SUMS` as downloadable workflow artifacts.
 ## 4. Tag and publish only after manual desktop testing
 
 ```bash
-git tag -a v0.5.5 -m "MonkeyGain v0.5.5"
-git push origin v0.5.5
+git tag -a v0.6.3 -m "MonkeyGain v0.6.3"
+git push origin v0.6.3
 ```
 
-On GitHub, open **Releases → Draft a new release**, select `v0.5.5`, paste
+On GitHub, open **Releases → Draft a new release**, select `v0.6.3`, paste
 release notes derived from `CHANGELOG.md`, and attach the verified `.deb` and
 `SHA256SUMS`. Mark the release as a prerelease while platform testing is
 incomplete. Do not describe the package as Flatpak, AppCenter or an official
@@ -68,7 +68,7 @@ Ubuntu package.
 ## 5. Installing from GitHub Releases
 
 Users on compatible Debian-based distributions can download the `.deb` and
-run `sudo apt install ./monkeygain_0.5.5_all.deb`. This delegates dependency
+run `sudo apt install ./monkeygain_0.6.3_all.deb`. This delegates dependency
 resolution to APT (including GTK 4, PyGObject, Mutagen and rsgain).
 
 Users can verify the checksum from the same release with `sha256sum -c

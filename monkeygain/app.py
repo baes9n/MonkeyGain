@@ -59,7 +59,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
     def __init__(self, application: Gtk.Application, backend):
         super().__init__(application=application, title='MonkeyGain')
         self.set_default_size(1180, 780)
-        self.set_size_request(800, 580)
+        self.set_size_request(820, 580)
         self._files: set[Path] = set()
         self._rows: list[dict] = []  # Only rendered rows on the current page.
         self._visible_rows: dict[Path, dict] = {}
@@ -107,6 +107,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self.connect('close-request', self._on_close)
         self._init_css()
         self._create_widgets()
+        self._install_keyboard_shortcuts()
         self._set_appearance(self._settings.get('theme', 'dark'))
         self._append_log('ReplayGain engine ready.\n')
         self._update_collection()
@@ -175,7 +176,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
 
         content = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         content.set_wide_handle(False)
-        content.set_position(700)
+        content.set_position(840)
         content.set_resize_start_child(True)
         content.set_shrink_start_child(False)
         content.set_resize_end_child(False)
@@ -183,11 +184,11 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         content.set_vexpand(True)
         root.append(content)
 
-        workspace = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
-        workspace.set_margin_start(22)
-        workspace.set_margin_end(18)
-        workspace.set_margin_top(20)
-        workspace.set_margin_bottom(12)
+        workspace = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        workspace.set_margin_start(16)
+        workspace.set_margin_end(14)
+        workspace.set_margin_top(16)
+        workspace.set_margin_bottom(10)
         content.set_start_child(workspace)
 
         overview = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
@@ -197,8 +198,13 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         headings.append(label('Scan Queue', 'mg-title'))
         headings.append(label('Import music, select albums, and scan ReplayGain.', 'mg-description', wrap=True))
         overview.append(headings)
-        self.count_label = label('0 albums · 0 tracks', 'mg-count')
-        overview.append(self.count_label)
+        counters = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        counters.set_halign(Gtk.Align.END)
+        self.count_label = label('0 albums · 0 tracks', 'mg-count', xalign=1)
+        self.selection_label = label('0 selected', 'mg-muted-small', xalign=1)
+        counters.append(self.count_label)
+        counters.append(self.selection_label)
+        overview.append(counters)
         workspace.append(overview)
 
         search_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -215,24 +221,31 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self.tags_filter.connect('notify::selected', self._on_search_changed)
         search_row.append(self.tags_filter)
         self.filter_count = label('', 'mg-muted-small')
-        search_row.append(self.filter_count)
+        self.filter_count.set_visible(False)
         workspace.append(search_row)
 
-        selection_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        selection_row.add_css_class('mg-selection-bar')
+        # Keep selection actions in one compact, keyboard-operable popover.
+        # The number selected stays visible above even when this menu is closed.
+        selection_menu_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        selection_menu_content.set_margin_top(8)
+        selection_menu_content.set_margin_bottom(8)
+        selection_menu_content.set_margin_start(8)
+        selection_menu_content.set_margin_end(8)
         self.select_matches_button = button('Select Matches', 'edit-select-all-symbolic',
                                             self._select_matches)
         self.select_matches_button.set_tooltip_text(
-            'Select all albums matching the search and tag filters, including other pages.')
-        selection_row.append(self.select_matches_button)
+            'Select all albums matching the search and tag filter, including other pages.')
+        selection_menu_content.append(self.select_matches_button)
         self.clear_selection_button = button('Clear Selection', 'edit-clear-symbolic',
                                              self._clear_selection)
-        selection_row.append(self.clear_selection_button)
-        self.selection_label = label('0 albums selected', 'mg-selection-count')
-        self.selection_label.set_hexpand(True)
-        self.selection_label.set_halign(Gtk.Align.END)
-        selection_row.append(self.selection_label)
-        workspace.append(selection_row)
+        selection_menu_content.append(self.clear_selection_button)
+        selection_popover = Gtk.Popover()
+        selection_popover.set_child(selection_menu_content)
+        self.selection_menu = Gtk.MenuButton()
+        self.selection_menu.set_label('Selection')
+        self.selection_menu.set_popover(selection_popover)
+        self.selection_menu.set_tooltip_text('Select matching albums or clear all checked albums')
+        search_row.append(self.selection_menu)
 
         self.album_scroller = Gtk.ScrolledWindow()
         self.album_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -240,6 +253,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self.album_scroller.add_css_class('mg-card')
         self.album_list = Gtk.ListBox()
         self.album_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.album_list.connect('row-activated', self._on_album_activated)
         self.album_list.add_css_class('mg-album-list')
         self.album_list.set_placeholder(self._placeholder())
         self.album_scroller.set_child(self.album_list)
@@ -262,27 +276,28 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
 
         sidebar_scroller = Gtk.ScrolledWindow()
         sidebar_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        sidebar_scroller.set_size_request(300, -1)
+        sidebar_scroller.set_size_request(276, -1)
         sidebar_scroller.add_css_class('mg-sidebar')
-        sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=17)
-        sidebar.set_margin_start(20)
-        sidebar.set_margin_end(20)
-        sidebar.set_margin_top(20)
-        sidebar.set_margin_bottom(20)
+        sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        sidebar.set_margin_start(15)
+        sidebar.set_margin_end(15)
+        sidebar.set_margin_top(17)
+        sidebar.set_margin_bottom(14)
         sidebar_scroller.set_child(sidebar)
         content.set_end_child(sidebar_scroller)
         sidebar.append(label('Analysis Options', 'mg-title'))
-        sidebar.append(label('Choose how to scan and update your music.', 'mg-description'))
-        self.config_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        self.config_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         sidebar.append(self.config_box)
 
         self.loud_spin = Gtk.SpinButton.new_with_range(-30, -5, 1)
         self.loud_spin.set_value(int(self._settings.get('loudness', -18)))
         self._field('Target Loudness', self.loud_spin, 'LUFS')
+        self.loud_spin.set_tooltip_text('Target loudness in LUFS; default −18')
         self.peak_spin = Gtk.SpinButton.new_with_range(-20, 0, 0.5)
         self.peak_spin.set_digits(1)
         self.peak_spin.set_value(float(self._settings.get('max_peak', -1)))
         self._field('Maximum Peak', self.peak_spin, 'dB')
+        self.peak_spin.set_tooltip_text('Maximum peak in decibels; default −1.0 dB')
         self.clip_choice = Gtk.DropDown.new_from_strings([
             'Positive gain only', 'Always protect', 'No protection',
         ])
@@ -320,10 +335,10 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self.notify_switch.connect('notify::active', self._save_settings)
 
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        footer.set_margin_start(22)
-        footer.set_margin_end(22)
-        footer.set_margin_top(10)
-        footer.set_margin_bottom(12)
+        footer.set_margin_start(16)
+        footer.set_margin_end(16)
+        footer.set_margin_top(8)
+        footer.set_margin_bottom(10)
         footer.add_css_class('mg-footer')
         status_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         status_box.set_hexpand(True)
@@ -342,6 +357,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         footer.append(self.progress)
         self.cancel_button = button('Cancel', 'process-stop-symbolic', self._cancel_current)
         self.cancel_button.set_sensitive(False)
+        self.cancel_button.set_visible(False)
         footer.append(self.cancel_button)
         self.run_button = button('Scan Selected', 'media-playback-start-symbolic',
                                  lambda *_: self._confirm_start(False), 'mg-primary')
@@ -523,6 +539,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self.progress.set_visible(True)
         self.progress.set_fraction(0)
         self.progress.set_text('Discovering files…')
+        self.cancel_button.set_visible(True)
         self.cancel_button.set_sensitive(True)
         self._import_started_at = time.monotonic()
         self.status_label.set_text('Finding audio files…')
@@ -601,9 +618,9 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             GLib.source_remove(self._import_pulse_timer)
             self._import_pulse_timer = None
         self.cancel_button.set_sensitive(False)
-        self.progress.set_text('Import finished' if 'Imported ' in message else 'Import stopped')
-        if 'Imported ' in message:
-            self.progress.set_fraction(1)
+        self.cancel_button.set_visible(False)
+        self.progress.set_visible(False)
+        self.progress.set_text('')
         self._set_import_sensitive(True)
         self._update_selection_ui()
         self.status_label.set_text(message)
@@ -644,6 +661,57 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         prefix = '+' if signed and number > 0 else ''
         return f'{prefix}{number:.2f}' + (' ' + unit if unit else '')
 
+    def _on_album_activated(self, _listbox, widget):
+        """Enter/double-click on an album row toggles its track details."""
+        for row in self._rows:
+            if row['widget'] is widget:
+                row['toggle'].set_active(not row['toggle'].get_active())
+                return
+
+    def _install_keyboard_shortcuts(self):
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect('key-pressed', self._on_key_pressed)
+        self.add_controller(keys)
+        self.search_entry.set_tooltip_text('Search albums and tracks · Ctrl+F')
+        self.add_file_button.set_tooltip_text('Import audio files · Ctrl+O')
+        self.add_folder_button.set_tooltip_text('Import folder · Ctrl+Shift+O')
+        self.refresh_button.set_tooltip_text('Reload ReplayGain tags · Ctrl+R')
+        self.run_button.set_tooltip_text('Scan checked albums · Ctrl+Enter')
+        self.scan_all_button.set_tooltip_text('Scan every imported album · Ctrl+Shift+Enter')
+
+    def _on_key_pressed(self, _controller, keyval, _keycode, modifiers):
+        """Simple, predictable desktop shortcuts; no global key capture."""
+        control = bool(modifiers & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(modifiers & Gdk.ModifierType.SHIFT_MASK)
+        if modifiers & (Gdk.ModifierType.MOD1_MASK | Gdk.ModifierType.SUPER_MASK):
+            return False
+        if control and keyval in (Gdk.KEY_o, Gdk.KEY_O):
+            if self.add_folder_button.get_sensitive() and shift:
+                self._choose_folder()
+            elif self.add_file_button.get_sensitive() and not shift:
+                self._choose_files()
+            else:
+                return False
+            return True
+        if control and keyval in (Gdk.KEY_f, Gdk.KEY_F):
+            self.search_entry.grab_focus()
+            return True
+        if control and keyval in (Gdk.KEY_r, Gdk.KEY_R):
+            if self.refresh_button.get_sensitive():
+                self._refresh_tags()
+            return True
+        if control and keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            if shift and self.scan_all_button.get_sensitive():
+                self._confirm_start(True)
+            elif not shift and self.run_button.get_sensitive():
+                self._confirm_start(False)
+            return True
+        if keyval == Gdk.KEY_Escape and self.search_entry.has_focus() and self.search_entry.get_text():
+            self.search_entry.set_text('')
+            return True
+        return False
+
     def _on_search_changed(self, *_args):
         if self._scan_started_at is not None:
             self._follow_scan = False
@@ -667,7 +735,9 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             and matches_tag_filter((self._existing_tags.get(path) for path in job.files),
                                    tag_filter)]
         total = len(self._filtered_jobs)
-        self.filter_count.set_text(f'{total}/{len(self._jobs)} albums shown' if query or tag_filter else '')
+        self.tags_filter.set_tooltip_text(
+            f'{total:,} of {len(self._jobs):,} albums match' if (query or tag_filter)
+            else 'Filter imported albums by tag status; does not change Scan All')
         self.album_list.set_placeholder(
             self._no_matches_placeholder() if (query or tag_filter) else self._placeholder()
         )
@@ -678,27 +748,44 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         if self._busy or self._runner.running or self._scan_started_at is not None:
             return
         self._selection.toggle(folder, active)
+        row = self._visible_rows.get(folder)
+        if row is not None:
+            self._style_album_selection(row, active)
         self._update_selection_ui()
 
     def _select_matches(self, *_args):
         if self._busy or self._runner.running:
             return
         self._selection.select(job.folder for job in self._filtered_jobs)
+        self.selection_menu.popdown()
         for row in self._rows:
             row['checkbox'].set_active(True)
+            self._style_album_selection(row, True)
         self._update_selection_ui()
 
     def _clear_selection(self, *_args):
         if self._busy or self._runner.running:
             return
         self._selection.clear()
+        self.selection_menu.popdown()
         for row in self._rows:
             row['checkbox'].set_active(False)
+            self._style_album_selection(row, False)
         self._update_selection_ui()
+
+    @staticmethod
+    def _style_album_selection(row: dict, selected: bool) -> None:
+        """Highlight a checked album without changing its row geometry."""
+        item = row['widget']
+        if selected:
+            item.add_css_class('mg-selected-album')
+        else:
+            item.remove_css_class('mg-selected-album')
 
     def _update_selection_ui(self):
         count = self._selection.count()
-        self.selection_label.set_text(f'{count:,} of {len(self._jobs):,} albums selected')
+        self.selection_label.set_text(f'{count:,} selected' if self._jobs else 'No albums selected')
+        self.selection_menu.set_label('Selection' if count == 0 else f'Selection ({count:,})')
         active = (not self._busy and not self._runner.running
                   and self._scan_started_at is None)
         self.clear_selection_button.set_sensitive(active and count > 0)
@@ -817,7 +904,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         row['status'].set_text(caption)
         if icon_name:
             row['icon'].set_from_icon_name(icon_name)
-            row['icon'].set_visible(True)
+            row['icon'].set_visible(False)
         elif current == 'queued':
             row['icon'].set_visible(False)
 
@@ -848,6 +935,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         header.append(music_icon)
 
         album_checkbox = Gtk.CheckButton()
+        album_checkbox.add_css_class('mg-album-checkbox')
         album_checkbox.set_active(job.folder in self._selection.selected)
         album_checkbox.set_sensitive(not self._busy and self._scan_started_at is None
                                     and not self._runner.running)
@@ -892,6 +980,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             'tracks': track_widgets, 'folder': job.folder, 'files': job.files,
             'checkbox': album_checkbox, 'details': details, 'built': False,
             'track_cursor': 0, 'expand_caption': toggle_caption,
+            'header': header,
         }
         def on_expanded(control):
             active = control.get_active()
@@ -902,6 +991,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
                 self._build_track_details(row, job)
                 self._apply_metrics(row, self._results.get(job.folder, {}))
         toggle.connect('toggled', on_expanded)
+        self._style_album_selection(row, job.folder in self._selection.selected)
         self._update_expander_caption(row)
         self.album_list.append(item)
         if expanded:
@@ -1024,7 +1114,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             f'{tagged} files contain recognized ReplayGain/R128 tags, '
             f'{unknown} could not be inspected, {count - tagged - unknown} untagged.'
         )
-        row['icon'].set_visible(bool(tagged))
+        row['icon'].set_visible(False)
 
     def _apply_metrics(self, row: dict, result: dict) -> None:
         """Fresh scan measurements take priority over stored metadata.
@@ -1231,6 +1321,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self._scan_active_album = None
         self._scan_completed_albums = 0
         self._scan_cancel_requested = False
+        self.cancel_button.set_visible(True)
         self.status_label.set_text('Starting scan…')
         if self._scan_progress_timer is not None:
             GLib.source_remove(self._scan_progress_timer)
@@ -1343,6 +1434,8 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             control.set_sensitive(True)
         self._set_import_sensitive(True)
         self.cancel_button.set_sensitive(False)
+        self.cancel_button.set_visible(False)
+        self.progress.set_visible(False)
         self._update_selection_ui()
         if cancelled:
             message = f'Scan cancelled · {self._plural(success, "album")} completed, {errors} failed'
