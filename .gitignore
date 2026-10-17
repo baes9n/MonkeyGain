@@ -14,3 +14,7 @@ venv/
 build/
 dist/
 *.egg-info/
+
+# Generated Debian binary packages and staging artefacts
+dist/
+*.deb

@@ -31,9 +31,6 @@ window.mg-light { background-color: #f5f7fa; color: #202633; }
 .mg-primary { border-radius: 9px; background: #687cf1; background-image: none; color: #ffffff; font-weight: 700; padding: 9px 15px; }
 .mg-primary:hover { background: #778afb; }
 .mg-primary:disabled { opacity: .45; }
-.mg-log-card { border-radius: 12px; }
-.mg-dark .mg-log-card, .mg-dark textview.mg-log, .mg-dark textview.mg-log text { background: #11141b; color: #cfd8e7; }
-.mg-light .mg-log-card, .mg-light textview.mg-log, .mg-light textview.mg-log text { background: #e9edf3; color: #2f3845; }
 
 /* 0.2.0: compact, expandable album cards and legible analysis results. */
 .mg-album-heading { padding: 13px 12px 13px 10px; }
@@ -65,3 +62,26 @@ window.mg-light { background-color: #f5f7fa; color: #202633; }
 /* 0.3.1: highlight files with already-existing ReplayGain tags. */
 .mg-dark .mg-tagged-name { color: #93d7b5; }
 .mg-light .mg-tagged-name { color: #137751; }
+
+/* 0.4.1: bounded library navigation and a dedicated import progress row. */
+.mg-import-line { padding: 3px 0; }
+.mg-page-bar { padding: 2px 5px; }
+.mg-page-bar button { min-width: 90px; }
+.mg-load-more { margin: 8px 18px 12px; }
+
+/* 0.4.2: compact album selection instead of artwork cards. */
+.mg-album-heading { padding: 7px 12px 7px 9px; }
+.mg-album-title { font-size: 12px; }
+.mg-selection-bar { padding: 0 2px 3px; }
+.mg-selection-count { font-size: 11px; font-weight: 700; }
+.mg-selection-bar button { padding: 5px 9px; }
+
+/* 0.5.1: make per-album analysis details discoverable after a scan. */
+.mg-expand-caption { font-size: 10px; font-weight: 600; }
+.mg-expand-button { padding-left: 7px; padding-right: 8px; }
+
+/* 0.5.3: one unobtrusive progress area and stable scan focus. */
+.mg-footer progressbar { min-width: 190px; }
+.mg-scan-focus { border-left: 3px solid #879bff; }
+.mg-dark .mg-scan-focus { background-color: alpha(#8194ff, 0.11); }
+.mg-light .mg-scan-focus { background-color: alpha(#556edf, 0.08); }

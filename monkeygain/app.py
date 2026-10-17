@@ -5,19 +5,23 @@ import json
 import os
 from pathlib import Path
 import threading
+import sys
 import time
 
 import gi
 gi.require_version('Gtk', '4.0')
 from gi.repository import Gio, GLib, Gtk, Gdk, Pango
 
-from . import __version__
 from .activity import ActivityJournal, format_elapsed
 from .desktop import APP_ID
+from .startup import check_runtime
+from .importer import (ImportRunner, ImportUpdate, PAGE_SIZE, TRACKS_PER_BATCH,
+                       page_bounds, matches_tag_filter, matches_album, group_imported_paths)
+from .selection import AlbumSelection, plan_scan, plan_result_reveal
 from .metadata import (ExistingGain, TagRead, common_album_value,
                        linear_peak_db, load_existing_tags)
 from .core import (
-    ScanRunner, ScanSettings, ScanMetric, probe_backend, discover_audio,
+    ScanRunner, ScanSettings, ScanMetric, discover_audio,
     make_album_jobs,
 )
 
@@ -52,14 +56,29 @@ def button(text: str, icon: str, callback, css: str = '') -> Gtk.Button:
 
 
 class MonkeyGainWindow(Gtk.ApplicationWindow):
-    def __init__(self, application: Gtk.Application):
+    def __init__(self, application: Gtk.Application, backend):
         super().__init__(application=application, title='MonkeyGain')
         self.set_default_size(1180, 780)
         self.set_size_request(800, 580)
         self._files: set[Path] = set()
-        self._rows: list[dict] = []
+        self._rows: list[dict] = []  # Only rendered rows on the current page.
+        self._visible_rows: dict[Path, dict] = {}
+        self._filtered_jobs = []
+        self._album_folders: set[Path] = set()
+        self._page = 0
+        self._job_status: dict[Path, str] = {}
+        self._import_runner = ImportRunner(lambda update: GLib.idle_add(self._on_import_update, update))
+        self._import_generation = 0
+        self._import_pulse_timer = None
+        self._import_started_at: float | None = None
+        self._import_discovered = 0
+        self._import_inspected = 0
+        self._library_dirty = False
+        self._library_update_timer = None
+        self._search_timer = None
         self._results: dict[Path, dict] = {}
         self._existing_tags: dict[Path, TagRead] = {}
+        self._expanded_albums: dict[Path, bool] = {}
         self._tag_generation = 0
         self._scan_wrote_tags = False
         self._scan_started_at: float | None = None
@@ -67,13 +86,17 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self._scan_completed_albums = 0
         self._scan_cancel_requested = False
         self._scan_progress_timer: int | None = None
-        self._last_heartbeat_second = 0
-        self._scan_view_active = False
+        self._follow_scan = True  # Suspend automatically when the user navigates.
+        self._last_active_folder: Path | None = None
+        self._rendered_page_key = None
+        self._rendered_page_number = None
         self._activity_journal = ActivityJournal()
         self._jobs = []
+        self._scan_jobs = []  # Stable snapshot for currently running ScanRunner callbacks.
+        self._selection = AlbumSelection()
         self._busy = False
         self._settings = self._read_settings()
-        self.backend = probe_backend(self._settings.get('backend_path', ''))
+        self.backend = backend
         self._runner = ScanRunner(
             lambda line: GLib.idle_add(self._append_log, line),
             lambda idx, status: GLib.idle_add(self._on_job, idx, status),
@@ -85,8 +108,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self._init_css()
         self._create_widgets()
         self._set_appearance(self._settings.get('theme', 'dark'))
-        self._append_log(f'MonkeyGain {__version__} · Ready to scan.\n')
-        self._refresh_backend(log_failure=True)
+        self._append_log('ReplayGain engine ready.\n')
         self._update_collection()
 
     @staticmethod
@@ -107,7 +129,6 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             'write_tags': self.write_switch.get_active(),
             'skip_existing': self.skip_switch.get_active(),
             'theme': ('system', 'light', 'dark')[self.theme_choice.get_selected()],
-            'backend_path': self.backend_entry.get_text().strip(),
             'last_folder': self._settings.get('last_folder', ''),
             'notifications': self.notify_switch.get_active(),
         }
@@ -173,12 +194,45 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         overview.set_valign(Gtk.Align.CENTER)
         headings = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         headings.set_hexpand(True)
-        headings.append(label('Your Library', 'mg-title'))
-        headings.append(label('Import albums and analyze loudness without changing audio samples.', 'mg-description', wrap=True))
+        headings.append(label('Scan Queue', 'mg-title'))
+        headings.append(label('Import music, select albums, and scan ReplayGain.', 'mg-description', wrap=True))
         overview.append(headings)
         self.count_label = label('0 albums · 0 tracks', 'mg-count')
         overview.append(self.count_label)
         workspace.append(overview)
+
+        search_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.search_entry = Gtk.SearchEntry()
+        self.search_entry.set_placeholder_text('Find albums or tracks to select')
+        self.search_entry.set_tooltip_text('Search the album list. Use Select Matches to add matching albums to your scan selection.')
+        self.search_entry.set_hexpand(True)
+        self.search_entry.connect('search-changed', self._on_search_changed)
+        search_row.append(self.search_entry)
+        self.tags_filter = Gtk.DropDown.new_from_strings([
+            'All albums', 'Already tagged', 'Needs tags', 'Unreadable tags',
+        ])
+        self.tags_filter.set_tooltip_text('Show albums by ReplayGain tag status; select the matching albums with Select Matches.')
+        self.tags_filter.connect('notify::selected', self._on_search_changed)
+        search_row.append(self.tags_filter)
+        self.filter_count = label('', 'mg-muted-small')
+        search_row.append(self.filter_count)
+        workspace.append(search_row)
+
+        selection_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        selection_row.add_css_class('mg-selection-bar')
+        self.select_matches_button = button('Select Matches', 'edit-select-all-symbolic',
+                                            self._select_matches)
+        self.select_matches_button.set_tooltip_text(
+            'Select all albums matching the search and tag filters, including other pages.')
+        selection_row.append(self.select_matches_button)
+        self.clear_selection_button = button('Clear Selection', 'edit-clear-symbolic',
+                                             self._clear_selection)
+        selection_row.append(self.clear_selection_button)
+        self.selection_label = label('0 albums selected', 'mg-selection-count')
+        self.selection_label.set_hexpand(True)
+        self.selection_label.set_halign(Gtk.Align.END)
+        selection_row.append(self.selection_label)
+        workspace.append(selection_row)
 
         self.album_scroller = Gtk.ScrolledWindow()
         self.album_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -189,42 +243,22 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self.album_list.add_css_class('mg-album-list')
         self.album_list.set_placeholder(self._placeholder())
         self.album_scroller.set_child(self.album_list)
+        # Never fight the user's manual scrolling while a multi-album scan runs.
+        scroll_events = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+        scroll_events.connect('scroll', self._on_manual_scroll)
+        self.album_scroller.add_controller(scroll_events)
         workspace.append(self.album_scroller)
 
-        logs_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        logs_header.append(label('Analysis Activity', 'mg-section'))
-        space = Gtk.Box()
-        space.set_hexpand(True)
-        logs_header.append(space)
-        self.activity_spinner = Gtk.Spinner()
-        self.activity_spinner.set_tooltip_text('The analysis process is running')
-        logs_header.append(self.activity_spinner)
-        self.activity_timer_label = label('', 'mg-muted-small')
-        logs_header.append(self.activity_timer_label)
-        self.raw_log_toggle = Gtk.ToggleButton(label='Raw output')
-        self.raw_log_toggle.set_tooltip_text(
-            'Show the original command and complete rsgain output instead of live activity')
-        self.raw_log_toggle.connect('toggled', self._on_log_view_changed)
-        logs_header.append(self.raw_log_toggle)
-        logs_header.append(button('Export raw', 'document-save-symbolic', self._export_log))
-        workspace.append(logs_header)
-        log_scroll = Gtk.ScrolledWindow()
-        log_scroll.set_min_content_height(147)
-        log_scroll.set_size_request(-1, 150)
-        log_scroll.add_css_class('mg-log-card')
-        self.log_view = Gtk.TextView()
-        self.log_view.set_editable(False)
-        self.log_view.set_cursor_visible(False)
-        self.log_view.set_monospace(True)
-        self.log_view.set_wrap_mode(Gtk.WrapMode.CHAR)
-        self.log_view.set_left_margin(12)
-        self.log_view.set_right_margin(12)
-        self.log_view.set_top_margin(10)
-        self.log_view.set_bottom_margin(10)
-        self.log_view.add_css_class('mg-log')
-        self._create_log_tags()
-        log_scroll.set_child(self.log_view)
-        workspace.append(log_scroll)
+        paging = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        paging.add_css_class('mg-page-bar')
+        self.prev_page = button('Previous', 'go-previous-symbolic', lambda *_: self._switch_page(-1))
+        paging.append(self.prev_page)
+        self.page_label = label('Page 1 of 1', 'mg-muted-small', xalign=0.5)
+        self.page_label.set_hexpand(True)
+        paging.append(self.page_label)
+        self.next_page = button('Next', 'go-next-symbolic', lambda *_: self._switch_page(+1))
+        paging.append(self.next_page)
+        workspace.append(paging)
 
         sidebar_scroller = Gtk.ScrolledWindow()
         sidebar_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -237,8 +271,8 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         sidebar.set_margin_bottom(20)
         sidebar_scroller.set_child(sidebar)
         content.set_end_child(sidebar_scroller)
-        sidebar.append(label('Settings', 'mg-title'))
-        sidebar.append(label('Custom profile · rsgain custom', 'mg-description'))
+        sidebar.append(label('Analysis Options', 'mg-title'))
+        sidebar.append(label('Choose how to scan and update your music.', 'mg-description'))
         self.config_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
         sidebar.append(self.config_box)
 
@@ -274,17 +308,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
                                           'Notify when a scan finishes',
                                           bool(self._settings.get('notifications', True)), sidebar)
         sidebar.append(Gtk.Separator())
-        sidebar.append(label('rsgain Executable', 'mg-field-label'))
-        self.backend_entry = Gtk.Entry()
-        self.backend_entry.set_text(self._settings.get('backend_path', ''))
-        self.backend_entry.set_placeholder_text('Auto-detect')
-        self.backend_entry.set_tooltip_text('Leave blank to search PATH and standard Linux locations.')
-        sidebar.append(self.backend_entry)
-        self.backend_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.backend_row.append(button('Browse…', 'document-open-symbolic', self._browse_backend))
-        self.backend_row.append(button('Check', 'view-refresh-symbolic', self._check_backend))
-        sidebar.append(self.backend_row)
-        sidebar.append(label('Albums are grouped by folder. Do not mix separate albums in the same folder.',
+        sidebar.append(label('Albums are grouped by folder. Keep separate albums in separate folders.',
                              'mg-hint', wrap=True))
 
         for control in (self.loud_spin, self.peak_spin):
@@ -294,7 +318,6 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self.clip_choice.connect('notify::selected', self._save_settings)
         self.theme_choice.connect('notify::selected', self._theme_changed)
         self.notify_switch.connect('notify::active', self._save_settings)
-        self.backend_entry.connect('changed', self._save_settings)
 
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         footer.set_margin_start(22)
@@ -305,22 +328,29 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         status_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         status_box.set_hexpand(True)
         self.status_label = label('Ready · Add files or folders', 'mg-description')
+        self.status_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.status_label.set_max_width_chars(30)
         status_box.append(self.status_label)
-        self.engine_label = label('Checking rsgain…', 'mg-muted-small')
-        status_box.append(self.engine_label)
         footer.append(status_box)
         self.progress = Gtk.ProgressBar()
-        self.progress.set_size_request(170, -1)
+        self.progress.set_size_request(210, -1)
         self.progress.set_valign(Gtk.Align.CENTER)
         self.progress.set_show_text(True)
         self.progress.set_fraction(0)
-        self.progress.set_text('0% · albums')
+        self.progress.set_text('')
+        self.progress.set_visible(False)
         footer.append(self.progress)
-        self.cancel_button = button('Cancel', 'process-stop-symbolic', self._cancel)
+        self.cancel_button = button('Cancel', 'process-stop-symbolic', self._cancel_current)
         self.cancel_button.set_sensitive(False)
         footer.append(self.cancel_button)
-        self.run_button = button('Start Scan', 'media-playback-start-symbolic', self._confirm_start, 'mg-primary')
+        self.run_button = button('Scan Selected', 'media-playback-start-symbolic',
+                                 lambda *_: self._confirm_start(False), 'mg-primary')
+        self.run_button.set_tooltip_text('Analyze only checked albums, even when hidden by search or pagination.')
         footer.append(self.run_button)
+        self.scan_all_button = button('Scan All', 'media-playback-start-symbolic',
+                                      lambda *_: self._confirm_start(True))
+        self.scan_all_button.set_tooltip_text('Analyze every imported album, ignoring selection and filters.')
+        footer.append(self.scan_all_button)
         root.append(footer)
 
     def _placeholder(self) -> Gtk.Widget:
@@ -335,6 +365,17 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         block.append(icon)
         block.append(label('Your music starts here', 'mg-section', xalign=0.5))
         block.append(label('Drop audio files or folders here, or use Add Files / Add Folder.',
+                           'mg-description', xalign=0.5))
+        return block
+
+    def _no_matches_placeholder(self) -> Gtk.Widget:
+        block = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9)
+        block.set_halign(Gtk.Align.CENTER)
+        block.set_valign(Gtk.Align.CENTER)
+        block.set_margin_top(65)
+        block.set_margin_bottom(65)
+        block.append(label('No matching albums', 'mg-section', xalign=0.5))
+        block.append(label('Try a different artist, album or track name.',
                            'mg-description', xalign=0.5))
         return block
 
@@ -369,59 +410,15 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         container.append(row)
         return control
 
-    def _create_log_tags(self):
-        buffer = self.log_view.get_buffer()
-        for kind in ('info', 'working', 'success', 'warning', 'error'):
-            buffer.create_tag('mg-log-' + kind)
-        self._style_log_tags('dark')
-
-    def _style_log_tags(self, palette: str):
-        dark = palette == 'dark'
-        colors = ({
-            'info': '#aab6cb', 'working': '#a7b8ff',
-            'success': '#91d8b1', 'warning': '#eac184', 'error': '#f5a2a0',
-        } if dark else {
-            'info': '#48546b', 'working': '#465fbc',
-            'success': '#176f4d', 'warning': '#94601c', 'error': '#b33336',
-        })
-        tags = self.log_view.get_buffer().get_tag_table()
-        for kind, color in colors.items():
-            tag = tags.lookup('mg-log-' + kind)
-            if tag is not None:
-                tag.set_property('foreground', color)
-                tag.set_property('weight', 700 if kind in ('success', 'error') else 400)
-
     def _log_elapsed(self):
         if self._scan_started_at is None:
             return None
         return max(0, int(time.monotonic() - self._scan_started_at))
 
     def _append_activity(self, level: str, message: str, elapsed: int | None = None):
-        event = self._activity_journal.add(level, message, elapsed)
-        if not self.raw_log_toggle.get_active():
-            self._insert_log_text(event.display(), 'mg-log-' + level)
+        """Save diagnostic events without a visible terminal-style console."""
+        self._activity_journal.add(level, message, elapsed)
         return GLib.SOURCE_REMOVE
-
-    def _insert_log_text(self, message: str, tag_name: str | None = None):
-        buffer = self.log_view.get_buffer()
-        if tag_name:
-            tag = buffer.get_tag_table().lookup(tag_name)
-            if tag is not None:
-                buffer.insert_with_tags(buffer.get_end_iter(), message, tag)
-            else:
-                buffer.insert(buffer.get_end_iter(), message)
-        else:
-            buffer.insert(buffer.get_end_iter(), message)
-        self.log_view.scroll_to_iter(buffer.get_end_iter(), 0, False, 0.0, 0.0)
-
-    def _on_log_view_changed(self, *_args):
-        buffer = self.log_view.get_buffer()
-        buffer.set_text('')
-        if self.raw_log_toggle.get_active():
-            self._insert_log_text(self._activity_journal.raw_text())
-        else:
-            for event in self._activity_journal.events:
-                self._insert_log_text(event.display(), 'mg-log-' + event.level)
 
     def _theme_changed(self, *_args):
         choice = ('system', 'light', 'dark')[self.theme_choice.get_selected()]
@@ -443,43 +440,6 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
                 dark = False
         self.add_css_class('mg-dark' if dark else 'mg-light')
         Gtk.Settings.get_default().set_property('gtk-application-prefer-dark-theme', dark)
-        self._style_log_tags('dark' if dark else 'light')
-
-    def _refresh_backend(self, *, log_failure: bool = False):
-        self.backend = probe_backend(self.backend_entry.get_text())
-        for css in ('mg-ok', 'mg-error'):
-            self.engine_label.remove_css_class(css)
-        if self.backend.path:
-            self.engine_label.set_text(f'rsgain {self.backend.version} · Ready' if self.backend.version != 'unknown' else 'rsgain · Ready')
-            self.engine_label.set_tooltip_text(self.backend.path)
-            self.engine_label.add_css_class('mg-ok')
-            self._append_log(f'Engine detected: {self.backend.path} (version: {self.backend.version})\n')
-        else:
-            self.engine_label.set_text('rsgain unavailable · Check executable path')
-            self.engine_label.set_tooltip_text(self.backend.error)
-            self.engine_label.add_css_class('mg-error')
-            if log_failure:
-                self._append_log('Engine diagnostics:\n' + self.backend.error + '\n')
-        if not self._runner.running:
-            self.run_button.set_sensitive(bool(self._jobs) and bool(self.backend.path) and not self._busy)
-
-    def _check_backend(self, *_args):
-        self._save_settings()
-        self._refresh_backend(log_failure=True)
-
-    def _browse_backend(self, *_args):
-        dialog = Gtk.FileDialog()
-        dialog.set_title('Choose rsgain Executable')
-        dialog.open(self, None, self._on_backend_selected)
-
-    def _on_backend_selected(self, dialog, result):
-        try:
-            file = dialog.open_finish(result)
-            if file.get_path():
-                self.backend_entry.set_text(file.get_path())
-                self._check_backend()
-        except GLib.Error:
-            return
 
     def _new_file_dialog(self, title: str) -> Gtk.FileDialog:
         dialog = Gtk.FileDialog()
@@ -553,48 +513,100 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         if not paths:
             return
         self._busy = True
+        self._import_generation += 1
+        self._import_discovered = 0
+        self._import_inspected = 0
         self._set_import_sensitive(False)
+        self.run_button.set_sensitive(False)
+        self.scan_all_button.set_sensitive(False)
         self._remember_folder(paths)
-        self.status_label.set_text('Searching for supported audio files…')
+        self.progress.set_visible(True)
+        self.progress.set_fraction(0)
+        self.progress.set_text('Discovering files…')
+        self.cancel_button.set_sensitive(True)
+        self._import_started_at = time.monotonic()
+        self.status_label.set_text('Finding audio files…')
+        if self._import_pulse_timer is not None:
+            GLib.source_remove(self._import_pulse_timer)
+        self._import_pulse_timer = GLib.timeout_add(120, self._pulse_import)
+        try:
+            self._import_runner.start(paths)
+        except Exception as exc:
+            self._end_import(f'Import could not start: {exc}')
 
-        generation = self._tag_generation
-
-        def task():
-            try:
-                result = discover_audio(paths)
-                existing = load_existing_tags(result)
-                GLib.idle_add(self._on_discovered, result, existing, '', generation)
-            except Exception as exc:
-                GLib.idle_add(self._on_discovered, [], {}, str(exc), generation)
-        threading.Thread(target=task, daemon=True).start()
-
-    def _on_discovered(self, new_files: list[Path], existing: dict[Path, TagRead],
-                       error: str, generation: int):
-        if generation != self._tag_generation:
+    def _pulse_import(self):
+        if not self._busy or self._import_started_at is None:
+            self._import_pulse_timer = None
             return GLib.SOURCE_REMOVE
-        self._busy = False
-        self._set_import_sensitive(True)
-        if error:
-            self._append_log(f'Import error: {error}\n')
-        old = len(self._files)
-        self._files.update(new_files)
-        self._existing_tags.update(existing)
-        tagged = sum(1 for tag in existing.values() if tag.info.tagged)
-        failures = [f'{path.name}: {tag.error}' for path, tag in existing.items() if tag.error]
-        self.status_label.set_text(
-            f'{len(self._files) - old} new files added · {tagged} with existing gain tags'
-        )
-        if failures:
-            self._append_log(
-                f'Metadata could not be read from {len(failures)} files. '
-                'Unverified files are not treated as untagged.\n'
-            )
-            for failure in failures[:5]:
-                self._append_log(f'  {failure}\n')
-        if not new_files:
-            self._append_log('No supported audio files were found.\n')
-        self._update_collection()
+        if self._import_inspected == 0:
+            self.progress.pulse()
+        return GLib.SOURCE_CONTINUE
+
+    def _cancel_import(self, *_args):
+        self._import_runner.cancel()
+        self.cancel_button.set_sensitive(False)
+        self.status_label.set_text('Stopping import safely…')
+        self.progress.set_text('Cancelling import…')
+
+    def _schedule_library_refresh(self):
+        if self._library_update_timer is None:
+            self._library_update_timer = GLib.timeout_add(350, self._flush_library_refresh)
+
+    def _flush_library_refresh(self):
+        self._library_update_timer = None
+        if self._library_dirty:
+            self._library_dirty = False
+            self._update_collection()
         return GLib.SOURCE_REMOVE
+
+    def _on_import_update(self, update: ImportUpdate):
+        if not self._busy:
+            return GLib.SOURCE_REMOVE
+        self._import_discovered = update.discovered
+        self._import_inspected = update.inspected
+        if update.phase == 'discovering':
+            self.progress.set_text(f'{update.discovered:,} files found')
+            self.status_label.set_text('Finding supported audio files…')
+        elif update.phase == 'reading':
+            if update.files:
+                previous = len(self._files)
+                self._files.update(update.files)
+                self._existing_tags.update(update.readings or {})
+                if len(self._files) > previous:
+                    self._library_dirty = True
+                    self._schedule_library_refresh()
+            total = update.discovered
+            if total:
+                self.progress.set_fraction(min(1, update.inspected / total))
+            self.progress.set_text(f'Importing {update.inspected:,}/{total:,} files')
+            self.status_label.set_text('Reading existing ReplayGain tags…')
+        elif update.phase in ('complete', 'cancelled', 'error'):
+            # Keep successfully imported batches even if the user cancels.
+            self._flush_library_refresh()
+            if update.phase == 'complete':
+                tagged = sum(bool(t.info.tagged) for t in self._existing_tags.values())
+                message = f'Imported {update.inspected:,} files · {tagged:,} with ReplayGain tags'
+            elif update.phase == 'cancelled':
+                message = f'Import cancelled · {update.inspected:,} files retained'
+            else:
+                message = f'Import error: {update.message}'
+                self._append_log(message + '\n')
+            self._end_import(message)
+        return GLib.SOURCE_REMOVE
+
+    def _end_import(self, message: str):
+        self._busy = False
+        self._import_started_at = None
+        if self._import_pulse_timer is not None:
+            GLib.source_remove(self._import_pulse_timer)
+            self._import_pulse_timer = None
+        self.cancel_button.set_sensitive(False)
+        self.progress.set_text('Import finished' if 'Imported ' in message else 'Import stopped')
+        if 'Imported ' in message:
+            self.progress.set_fraction(1)
+        self._set_import_sensitive(True)
+        self._update_selection_ui()
+        self.status_label.set_text(message)
 
     def _clear(self, *_args):
         if self._runner.running or self._busy:
@@ -603,7 +615,12 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self._files.clear()
         self._results.clear()
         self._existing_tags.clear()
+        self._selection.clear()
+        self._expanded_albums.clear()
+        self._job_status.clear()
+        self._page = 0
         self._update_collection()
+        self.progress.set_visible(False)
         self.status_label.set_text('Queue cleared')
 
     def _remove_folder(self, _button, folder: Path):
@@ -611,6 +628,9 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             return
         self._files = {file for file in self._files if file.parent != folder}
         self._results.pop(folder, None)
+        self._selection.toggle(folder, False)
+        self._expanded_albums.pop(folder, None)
+        self._job_status.pop(folder, None)
         self._update_collection()
 
     @staticmethod
@@ -624,7 +644,184 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         prefix = '+' if signed and number > 0 else ''
         return f'{prefix}{number:.2f}' + (' ' + unit if unit else '')
 
-    def _make_album_row(self, job, position: int) -> dict:
+    def _on_search_changed(self, *_args):
+        if self._scan_started_at is not None:
+            self._follow_scan = False
+        # Debounce keyboard input, so a large library isn't searched on each key.
+        if self._search_timer is not None:
+            GLib.source_remove(self._search_timer)
+        self._search_timer = GLib.timeout_add(180, self._search_now)
+
+    def _search_now(self):
+        self._search_timer = None
+        self._page = 0
+        self._apply_album_filter()
+        return GLib.SOURCE_REMOVE
+
+    def _apply_album_filter(self):
+        query = self.search_entry.get_text().strip()
+        tag_filter = self.tags_filter.get_selected()
+        self._filtered_jobs = [job for job in self._jobs
+            if (not query or matches_album(query, job.label, job.folder.parent.name,
+                                          (file.stem for file in job.files)))
+            and matches_tag_filter((self._existing_tags.get(path) for path in job.files),
+                                   tag_filter)]
+        total = len(self._filtered_jobs)
+        self.filter_count.set_text(f'{total}/{len(self._jobs)} albums shown' if query or tag_filter else '')
+        self.album_list.set_placeholder(
+            self._no_matches_placeholder() if (query or tag_filter) else self._placeholder()
+        )
+        self._render_page()
+        self._update_selection_ui()
+
+    def _toggle_selection(self, folder: Path, active: bool):
+        if self._busy or self._runner.running or self._scan_started_at is not None:
+            return
+        self._selection.toggle(folder, active)
+        self._update_selection_ui()
+
+    def _select_matches(self, *_args):
+        if self._busy or self._runner.running:
+            return
+        self._selection.select(job.folder for job in self._filtered_jobs)
+        for row in self._rows:
+            row['checkbox'].set_active(True)
+        self._update_selection_ui()
+
+    def _clear_selection(self, *_args):
+        if self._busy or self._runner.running:
+            return
+        self._selection.clear()
+        for row in self._rows:
+            row['checkbox'].set_active(False)
+        self._update_selection_ui()
+
+    def _update_selection_ui(self):
+        count = self._selection.count()
+        self.selection_label.set_text(f'{count:,} of {len(self._jobs):,} albums selected')
+        active = (not self._busy and not self._runner.running
+                  and self._scan_started_at is None)
+        self.clear_selection_button.set_sensitive(active and count > 0)
+        self.select_matches_button.set_sensitive(active and bool(self._filtered_jobs))
+        can_scan = active and bool(self.backend.path)
+        self.run_button.set_sensitive(can_scan and count > 0)
+        self.scan_all_button.set_sensitive(can_scan and bool(self._jobs))
+
+    def _on_manual_scroll(self, *_args):
+        if self._scan_started_at is not None:
+            self._follow_scan = False
+        return False
+
+    def _switch_page(self, delta: int):
+        if self._scan_started_at is not None:
+            self._follow_scan = False
+        self._page += delta
+        self._render_page()
+
+    def _render_page(self):
+        """Reuse unchanged rows so scans never reset expanded results or scroll."""
+        total = len(self._filtered_jobs)
+        self._page, start, end = page_bounds(total, self._page)
+        n_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        self.page_label.set_text(
+            f'Page {self._page + 1} of {n_pages} · {start + 1 if total else 0}–{end} of {total} albums')
+        self.prev_page.set_sensitive(self._page > 0)
+        self.next_page.set_sensitive(end < total)
+        key = tuple((job.folder, len(job.files)) for job in self._filtered_jobs[start:end])
+        if (self._rendered_page_key == key and self._rendered_page_number == self._page):
+            for row in self._rows:
+                folder = row['folder']
+                self._apply_metrics(row, self._results.get(folder, {}))
+                if folder not in self._job_status or self._job_status[folder] == '':
+                    self._tag_status(row)
+                self._show_job_status(row, self._job_status.get(folder, ''))
+            return
+        old_page = self._rendered_page_number
+        old_scroll = self.album_scroller.get_vadjustment().get_value()
+        self._rendered_page_key = key
+        self._rendered_page_number = self._page
+        self._rows.clear()
+        self._visible_rows.clear()
+        while widget := self.album_list.get_row_at_index(0):
+            self.album_list.remove(widget)
+        for job in self._filtered_jobs[start:end]:
+            row = self._make_album_row(job)
+            self._visible_rows[job.folder] = row
+            self._rows.append(row)
+            self._apply_metrics(row, self._results.get(job.folder, {}))
+            self._tag_status(row)
+            self._show_job_status(row, self._job_status.get(job.folder, ''))
+            if job.folder == self._last_active_folder:
+                row['widget'].add_css_class('mg-scan-focus')
+        # A deliberate page change starts at the top. For filtered refreshes on
+        # the same page, restore the reader's position after GTK layout.
+        target = old_scroll if old_page == self._page else 0
+        GLib.idle_add(self._restore_album_scroll, target)
+
+    def _restore_album_scroll(self, target: float):
+        adjustment = self.album_scroller.get_vadjustment()
+        maximum = max(adjustment.get_lower(), adjustment.get_upper() - adjustment.get_page_size())
+        adjustment.set_value(min(max(adjustment.get_lower(), target), maximum))
+        return GLib.SOURCE_REMOVE
+
+    def _focus_active_album(self, folder: Path):
+        """Follow a running album unless the user has manually navigated."""
+        if not self._follow_scan:
+            return
+        index = next((n for n, job in enumerate(self._filtered_jobs)
+                      if job.folder == folder), None)
+        if index is None:  # Respect an active search/filter rather than clearing it.
+            return
+        page = index // PAGE_SIZE
+        if page != self._page:
+            self._page = page
+            self._render_page()
+        GLib.idle_add(self._scroll_to_active_album, folder)
+
+    def _scroll_to_active_album(self, folder: Path):
+        row = self._visible_rows.get(folder)
+        if row is None or not self._follow_scan:
+            return GLib.SOURCE_REMOVE
+        try:
+            ok, bounds = row['widget'].compute_bounds(self.album_list)
+            if not ok:
+                return GLib.SOURCE_REMOVE
+            top = bounds.get_y() if hasattr(bounds, 'get_y') else bounds.origin.y
+            height = bounds.get_height() if hasattr(bounds, 'get_height') else bounds.size.height
+            adjustment = self.album_scroller.get_vadjustment()
+            viewport_top = adjustment.get_value()
+            viewport_bottom = viewport_top + adjustment.get_page_size()
+            if top < viewport_top + 12:
+                adjustment.set_value(max(adjustment.get_lower(), top - 12))
+            elif top + height > viewport_bottom - 12:
+                max_scroll = max(adjustment.get_lower(),
+                                 adjustment.get_upper() - adjustment.get_page_size())
+                adjustment.set_value(min(max_scroll,
+                                         top + height - adjustment.get_page_size() + 12))
+        except (AttributeError, TypeError, ValueError):
+            # Scrolling assistance should never interrupt an audio scan.
+            pass
+        return GLib.SOURCE_REMOVE
+
+    def _show_job_status(self, row: dict, current: str):
+        captions = {
+            'running': ('Scanning…', 'view-refresh-symbolic'),
+            'success': ('Completed', 'emblem-ok-symbolic'),
+            'failed': ('Failed', 'dialog-error-symbolic'),
+            'cancelled': ('Cancelled', 'process-stop-symbolic'),
+            'queued': ('Queued', None),
+        }
+        if current not in captions:
+            return
+        caption, icon_name = captions[current]
+        row['status'].set_text(caption)
+        if icon_name:
+            row['icon'].set_from_icon_name(icon_name)
+            row['icon'].set_visible(True)
+        elif current == 'queued':
+            row['icon'].set_visible(False)
+
+    def _make_album_row(self, job) -> dict:
         item = Gtk.ListBoxRow()
         item.add_css_class('mg-album-row')
         wrapper = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -632,19 +829,32 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         header.add_css_class('mg-album-heading')
         toggle = Gtk.ToggleButton()
-        toggle.set_active(position == 0)
-        toggle.set_tooltip_text('Expand or collapse tracks')
+        expanded = self._expanded_albums.get(job.folder, False)
+        toggle.set_active(expanded)
         toggle.add_css_class('mg-expand-button')
-        arrow = Gtk.Image.new_from_icon_name('pan-end-symbolic')
-        toggle.set_child(arrow)
+        details_icon = Gtk.Image.new_from_icon_name('view-list-symbolic')
+        # A list icon cannot be mistaken for a Play button.
+        toggle_content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        toggle_content.append(details_icon)
+        toggle_caption = label('', 'mg-expand-caption')
+        toggle_content.append(toggle_caption)
+        toggle.set_child(toggle_content)
         header.append(toggle)
 
-        album_art = Gtk.Box()
-        album_art.add_css_class('mg-album-icon')
-        art_icon = Gtk.Image.new_from_icon_name('media-optical-symbolic')
-        art_icon.set_pixel_size(23)
-        album_art.append(art_icon)
-        header.append(album_art)
+        # Compact icon only: never read embedded or external artwork.
+        music_icon = Gtk.Image.new_from_icon_name('media-optical-symbolic')
+        music_icon.set_pixel_size(17)
+        music_icon.add_css_class('mg-muted')
+        header.append(music_icon)
+
+        album_checkbox = Gtk.CheckButton()
+        album_checkbox.set_active(job.folder in self._selection.selected)
+        album_checkbox.set_sensitive(not self._busy and self._scan_started_at is None
+                                    and not self._runner.running)
+        album_checkbox.set_tooltip_text('Include this album in Scan Selected')
+        album_checkbox.connect('toggled', lambda control, folder=job.folder:
+            self._toggle_selection(folder, control.get_active()))
+        header.insert_child_after(album_checkbox, None)
 
         titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         titles.set_hexpand(True)
@@ -670,18 +880,51 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         revealer = Gtk.Revealer()
         revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
         revealer.set_transition_duration(160)
-        revealer.set_reveal_child(position == 0)
-        toggle.connect('toggled', lambda control: (
-            revealer.set_reveal_child(control.get_active()),
-            arrow.set_from_icon_name('pan-down-symbolic' if control.get_active() else 'pan-end-symbolic'),
-        ))
-        if position == 0:
-            arrow.set_from_icon_name('pan-down-symbolic')
-        wrapper.append(revealer)
+        revealer.set_reveal_child(expanded)
         details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         details.add_css_class('mg-details')
         revealer.set_child(details)
+        wrapper.append(revealer)
+        track_widgets = {}
+        row = {
+            'status': status, 'icon': status_icon, 'revealer': revealer,
+            'toggle': toggle, 'widget': item, 'stat_values': {},
+            'tracks': track_widgets, 'folder': job.folder, 'files': job.files,
+            'checkbox': album_checkbox, 'details': details, 'built': False,
+            'track_cursor': 0, 'expand_caption': toggle_caption,
+        }
+        def on_expanded(control):
+            active = control.get_active()
+            self._expanded_albums[job.folder] = active
+            revealer.set_reveal_child(active)
+            self._update_expander_caption(row)
+            if active and not row['built']:
+                self._build_track_details(row, job)
+                self._apply_metrics(row, self._results.get(job.folder, {}))
+        toggle.connect('toggled', on_expanded)
+        self._update_expander_caption(row)
+        self.album_list.append(item)
+        if expanded:
+            self._build_track_details(row, job)
+        return row
 
+    def _update_expander_caption(self, row: dict) -> None:
+        """Make existing scan results easy to discover without building hidden rows."""
+        result = self._results.get(row['folder'], {})
+        has_results = bool(result.get('tracks') or result.get('album'))
+        is_open = row['toggle'].get_active()
+        caption = ('Hide results' if is_open else 'View results') if has_results else (
+            'Hide tracks' if is_open else 'Show tracks')
+        row['expand_caption'].set_text(caption)
+        row['toggle'].set_tooltip_text(
+            'Show album and per-track measurements' if has_results else 'Show tracks and existing ReplayGain tags')
+
+    def _build_track_details(self, row: dict, job):
+        """Create track widgets only for expanded, on-screen album cards."""
+        if row['built']:
+            return
+        row['built'] = True
+        details = row['details']
         album_stats = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
         album_stats.add_css_class('mg-album-stats')
         stat_values = {}
@@ -713,11 +956,23 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             columns.append(head)
         details.append(columns)
 
-        track_widgets = {}
-        for n, file in enumerate(job.files, start=1):
+        row['stat_values'] = stat_values
+        self._add_more_tracks(row, job)
+
+    def _add_more_tracks(self, row: dict, job):
+        """Only render up to TRACKS_PER_BATCH tracks per expansion action."""
+        details = row['details']
+        more = row.get('more_button')
+        if more is not None:
+            details.remove(more)
+            row['more_button'] = None
+        start = row['track_cursor']
+        end = min(start + TRACKS_PER_BATCH, len(job.files))
+        for n in range(start, end):
+            file = job.files[n]
             track_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
             track_row.add_css_class('mg-track-row')
-            number = label(f'{n:02}', 'mg-track-index')
+            number = label(f'{n + 1:02}', 'mg-track-index')
             number.set_width_chars(3)
             track_row.append(number)
             name = label(file.stem, 'mg-track-name')
@@ -736,13 +991,20 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
                 track_row.append(value)
                 values[key] = value
             details.append(track_row)
-            track_widgets[file.name] = {'values': values, 'row': track_row, 'title': name, 'file': file}
-        self.album_list.append(item)
-        return {
-            'status': status, 'icon': status_icon, 'revealer': revealer,
-            'toggle': toggle, 'stat_values': stat_values,
-            'tracks': track_widgets, 'folder': job.folder, 'files': job.files,
-        }
+            row['tracks'][file.name] = {'values': values, 'row': track_row,
+                                        'title': name, 'file': file}
+        row['track_cursor'] = end
+        if end < len(job.files):
+            more = button(f'Show next {min(TRACKS_PER_BATCH, len(job.files) - end)} tracks',
+                          'go-down-symbolic',
+                          lambda *_: self._show_more_tracks(row, job))
+            more.add_css_class('mg-load-more')
+            details.append(more)
+            row['more_button'] = more
+        self._apply_metrics(row, self._results.get(job.folder, {}))
+
+    def _show_more_tracks(self, row, job):
+        self._add_more_tracks(row, job)
 
     def _tag_status(self, row: dict) -> None:
         readings = [self._existing_tags.get(path) for path in row['files']]
@@ -772,6 +1034,8 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         """
         album: ScanMetric | None = result.get('album')
         stats = row['stat_values']
+        if not stats:
+            return
         readings = [self._existing_tags.get(path, TagRead()).info for path in row['files']]
         album_gain, gain_mixed = common_album_value(tag.album_gain for tag in readings)
         album_peak, peak_mixed = common_album_value(tag.album_peak for tag in readings)
@@ -849,40 +1113,40 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
                     values['peak'].set_tooltip_text('Existing linear ReplayGain peak converted to dB; sample/true peak type unknown')
 
     def _update_collection(self):
-        self._jobs = make_album_jobs(self._files)
+        self._jobs = group_imported_paths(self._files)
+        self._album_folders = {job.folder for job in self._jobs}
+        self._selection.prune(self._album_folders)
         self.refresh_button.set_sensitive(bool(self._files) and not self._busy and not self._runner.running)
-        self._rows.clear()
-        while row := self.album_list.get_row_at_index(0):
-            self.album_list.remove(row)
-        ntracks = sum(len(job.files) for job in self._jobs)
-        self.count_label.set_text(f'{self._plural(len(self._jobs), "album")}  ·  {self._plural(ntracks, "track")}')
-        for position, job in enumerate(self._jobs):
-            row = self._make_album_row(job, position)
-            self._apply_metrics(row, self._results.get(job.folder, {}))
-            self._tag_status(row)
-            self._rows.append(row)
-        if not self._runner.running:
-            self.progress.set_fraction(0)
-            self.progress.set_text('0% · albums')
-            self.run_button.set_sensitive(bool(self._jobs) and bool(self.backend.path) and not self._busy)
+        self.count_label.set_text(f'{self._plural(len(self._jobs), "album")}  ·  '
+                                  f'{self._plural(len(self._files), "track")}')
+        self._apply_album_filter()
+        if not self._runner.running and not self._busy and self._scan_started_at is None:
+            if not self._files:
+                self.progress.set_visible(False)
+        self._update_selection_ui()
 
     def _on_metric(self, index: int, metric: ScanMetric):
-        if index >= len(self._jobs) or index >= len(self._rows):
+        if index >= len(self._scan_jobs):
             return GLib.SOURCE_REMOVE
-        folder = self._jobs[index].folder
+        folder = self._scan_jobs[index].folder
         result = self._results.setdefault(folder, {'tracks': {}, 'album': None})
         if metric.is_album:
             result['album'] = metric
         else:
             result['tracks'][metric.filename] = metric
-        self._apply_metrics(self._rows[index], result)
+        if folder in self._visible_rows:
+            row = self._visible_rows[folder]
+            self._update_expander_caption(row)
+            self._apply_metrics(row, result)
         return GLib.SOURCE_REMOVE
 
     def _on_track(self, index: int, filename: str):
-        if index >= len(self._rows):
+        if index >= len(self._scan_jobs):
             return GLib.SOURCE_REMOVE
-        self.status_label.set_text(f'Scanning: {filename}  ·  {index + 1}/{len(self._rows)} albums')
-        row = self._rows[index]
+        self.status_label.set_text(f'Scanning: {filename}  ·  {index + 1}/{len(self._scan_jobs)} albums')
+        row = self._visible_rows.get(self._scan_jobs[index].folder)
+        if not row:
+            return GLib.SOURCE_REMOVE
         for trackname, item in row['tracks'].items():
             if trackname == filename:
                 item['row'].add_css_class('mg-active-track')
@@ -901,12 +1165,16 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             skip_existing=self.skip_switch.get_active(),
         )
 
-    def _confirm_start(self, *_args):
-        if not self._jobs or self._runner.running or self._busy:
+    def _confirm_start(self, all_albums: bool):
+        if self._runner.running or self._busy or self._scan_started_at is not None:
+            return
+        jobs = plan_scan(self._jobs, self._selection.selected, all_albums=all_albums)
+        if not jobs or not self.backend.path:
+            self.status_label.set_text('Select at least one album, or use Scan All')
             return
         config = self._scan_settings()
         if not config.write_tags:
-            self._start(config)
+            self._start(config, jobs)
             return
         dialog = Gtk.MessageDialog(
             transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
@@ -914,63 +1182,72 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             text='Write ReplayGain Tags?',
         )
         dialog.props.secondary_text = (
-            f'rsgain will update metadata in {sum(len(j.files) for j in self._jobs)} '
-            'audio files. The audio samples will not change, but tags will be modified. '
+            f'rsgain will update metadata in {sum(len(j.files) for j in jobs)} '
+            f'audio files across {len(jobs)} albums. '
+            'Audio samples will not change, but tags will be modified. '
             'We recommend testing with a copy of an album first.'
         )
         dialog.add_button('Cancel', Gtk.ResponseType.CANCEL)
         dialog.add_button('Write Tags', Gtk.ResponseType.ACCEPT)
         dialog.set_default_response(Gtk.ResponseType.CANCEL)
-        dialog.connect('response', self._confirm_response, config)
+        dialog.connect('response', self._confirm_response, config, tuple(jobs))
         dialog.present()
 
-    def _confirm_response(self, dialog, response, config):
+    def _confirm_response(self, dialog, response, config, jobs):
         dialog.destroy()
         if response == Gtk.ResponseType.ACCEPT:
-            self._start(config)
+            # Selection changes, clearing or re-importing are guarded while
+            # the confirmation is open by the stable frozen tuple of jobs.
+            self._start(config, list(jobs))
 
-    def _start(self, config: ScanSettings):
+    def _start(self, config: ScanSettings, jobs):
+        if self._runner.running or self._busy or self._scan_started_at is not None or not jobs:
+            return
+        self._scan_jobs = list(jobs)
         self._save_settings()
         self._scan_wrote_tags = config.write_tags
         self._activity_journal.clear()
-        # Each run opens with the friendly live view, never a wall of TSV rows.
-        self._scan_view_active = True
-        self.raw_log_toggle.set_active(False)
-        self.log_view.get_buffer().set_text('')
         self._append_activity('info',
-            f'Started scan queue · {self._plural(len(self._jobs), "album")} · '
-            f'{self._plural(sum(len(job.files) for job in self._jobs), "track")}', 0)
-        self._append_activity('info',
-            'Writing ReplayGain tags' if config.write_tags else 'Read-only analysis · no tags will be written', 0)
-        self._results.clear()
-        self._update_collection()
+            f'Started scan queue · {self._plural(len(self._scan_jobs), "album")} · '
+            f'{self._plural(sum(len(job.files) for job in self._scan_jobs), "track")}', 0)
+        # Update the existing GTK row widgets in place. Never re-render the
+        # entire album list when a scan begins: that used to reset its scroll.
+        for job in self._scan_jobs:
+            self._results.pop(job.folder, None)
+            self._job_status[job.folder] = 'queued'
+            row = self._visible_rows.get(job.folder)
+            if row:
+                self._apply_metrics(row, {})
+                self._update_expander_caption(row)
+                self._show_job_status(row, 'queued')
         for row in self._rows:
-            row['status'].set_text('Queued')
-            row['icon'].set_visible(False)
+            row['widget'].remove_css_class('mg-scan-focus')
+        self._follow_scan = True
+        self._last_active_folder = None
+        self.progress.set_visible(True)
         self.progress.set_fraction(0)
-        self.progress.set_text(f'0/{len(self._jobs)} albums · 0:00')
+        self.progress.set_text(f'0/{len(self._scan_jobs)} albums · 0:00')
         self._scan_started_at = time.monotonic()
         self._scan_active_album = None
         self._scan_completed_albums = 0
         self._scan_cancel_requested = False
-        self._last_heartbeat_second = 0
-        self.activity_timer_label.set_text('0:00 elapsed')
-        self.activity_spinner.start()
+        self.status_label.set_text('Starting scan…')
         if self._scan_progress_timer is not None:
             GLib.source_remove(self._scan_progress_timer)
-        self._scan_progress_timer = GLib.timeout_add(125, self._tick_scan_progress)
+        self._scan_progress_timer = GLib.timeout_add(250, self._tick_scan_progress)
         self.progress.pulse()
         self.run_button.set_sensitive(False)
+        self.scan_all_button.set_sensitive(False)
         self.cancel_button.set_sensitive(True)
         self._set_import_sensitive(False)
         self.config_box.set_sensitive(False)
         for control in (self.album_switch, self.true_peak_switch, self.write_switch, self.skip_switch,
-                        self.theme_choice, self.notify_switch, self.clip_choice,
-                        self.backend_entry, self.backend_row):
+                        self.theme_choice, self.notify_switch, self.clip_choice):
             control.set_sensitive(False)
         self.status_label.set_text('Starting scan…')
+        self.status_label.set_tooltip_text(None)
         try:
-            self._runner.start(list(self._jobs), config, self.backend.path or 'rsgain')
+            self._runner.start(list(self._scan_jobs), config, self.backend.path or 'rsgain')
         except Exception as exc:
             self._append_log(f'Could not start scan: {exc}\n')
             self._on_finished(0, 1, False)
@@ -980,64 +1257,55 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self.add_file_button.set_sensitive(active)
         self.clear_button.set_sensitive(active)
         self.refresh_button.set_sensitive(active and bool(self._files))
+        for row in self._rows:
+            row['checkbox'].set_sensitive(active)
+        self._update_selection_ui()
 
     def _tick_scan_progress(self):
-        """Keep an indeterminate progress indicator moving while rsgain scans.
+        """One progress area, with genuine album counts and elapsed time.
 
-        rsgain 3.4 --output does not provide trustworthy per-track percent
-        updates. Only completed album counts are treated as actual progress.
+        rsgain 3.4 TSV output has no trustworthy per-track percentage.
+        An animated pulse indicates an active subprocess, not estimated work.
         """
         if self._scan_started_at is None:
             self._scan_progress_timer = None
             return GLib.SOURCE_REMOVE
-        elapsed_seconds = max(0, int(time.monotonic() - self._scan_started_at))
-        elapsed = format_elapsed(elapsed_seconds)
-        self.activity_timer_label.set_text(f'{elapsed} elapsed')
-        # A heartbeat represents elapsed time, never a guessed track percentage.
-        # Keep the feed alive even if rsgain buffers TSV results until the end.
-        if (elapsed_seconds >= self._last_heartbeat_second + 10
-                and self._scan_active_album is not None and not self._scan_cancel_requested):
-            self._last_heartbeat_second = elapsed_seconds
-            album = self._jobs[self._scan_active_album]
-            self._append_activity('working',
-                f'Analyzing {album.label} · still running', elapsed_seconds)
-        total = len(self._jobs)
-        self.progress.set_text(f'{self._scan_completed_albums}/{total} albums · {elapsed}')
-        # Pulse even while the first subprocess starts, and while one album
-        # finishes before the next begins. This indicates activity, not a %.
+        elapsed = format_elapsed(time.monotonic() - self._scan_started_at)
+        total = len(self._scan_jobs)
+        self.progress.set_text(f'{self._scan_completed_albums}/{total} albums')
         self.progress.pulse()
         if self._scan_active_album is not None and not self._scan_cancel_requested:
             i = self._scan_active_album
             self.status_label.set_text(
-                f'Scanning album {i + 1}/{total}: {self._jobs[i].label} · {elapsed} elapsed'
+                f'Analyzing {self._scan_jobs[i].label} · album {i + 1}/{total} · {elapsed}'
             )
         return GLib.SOURCE_CONTINUE
 
     def _on_job(self, index: int, status: str):
-        mapping = {
-            'running': ('Scanning…', 'media-playback-start-symbolic'),
-            'success': ('Completed', 'emblem-ok-symbolic'),
-            'failed': ('Failed', 'dialog-error-symbolic'),
-            'cancelled': ('Cancelled', 'process-stop-symbolic'),
-        }
-        if index >= len(self._rows):
+        if index >= len(self._scan_jobs):
             return GLib.SOURCE_REMOVE
-        caption, icon_name = mapping.get(status, ('Queued', 'content-loading-symbolic'))
-        row = self._rows[index]
-        row['status'].set_text(caption)
-        row['icon'].set_from_icon_name(icon_name)
-        row['icon'].set_visible(True)
+        job = self._scan_jobs[index]
+        self._job_status[job.folder] = status
+        row = self._visible_rows.get(job.folder)
+        if row:
+            self._show_job_status(row, status)
         if status == 'running':
+            if self._last_active_folder in self._visible_rows:
+                self._visible_rows[self._last_active_folder]['widget'].remove_css_class('mg-scan-focus')
+            self._last_active_folder = job.folder
             self._scan_active_album = index
-            row['toggle'].set_active(True)
-            self.status_label.set_text(f'Scanning album {index + 1}/{len(self._rows)}: {self._jobs[index].label}')
+            self._focus_active_album(job.folder)
+            row = self._visible_rows.get(job.folder)
+            if row:
+                row['widget'].add_css_class('mg-scan-focus')
+            self.status_label.set_text(f'Scanning album {index + 1}/{len(self._scan_jobs)}: {job.label}')
             self._append_activity('working',
-                f'Analyzing album {index + 1}/{len(self._jobs)} · {self._jobs[index].label} '
-                f'({self._plural(len(self._jobs[index].files), "track")})', self._log_elapsed())
+                f'Analyzing album {index + 1}/{len(self._scan_jobs)} · {job.label} '
+                f'({self._plural(len(job.files), "track")})', self._log_elapsed())
         else:
             self._scan_active_album = None
             if status == 'success':
-                result = self._results.get(self._jobs[index].folder, {})
+                result = self._results.get(job.folder, {})
                 album = result.get('album')
                 extra = (f' · {album.loudness:.2f} LUFS · '
                          f'{album.gain:+.2f} dB Album Gain') if album else ''
@@ -1045,53 +1313,58 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
                 details = (f'{self._plural(num_metrics, "track")} reported' if num_metrics
                            else 'no track results in output')
                 self._append_activity('success',
-                    f'Completed {self._jobs[index].label} · {details}{extra}',
-                    self._log_elapsed())
+                    f'Completed {job.label} · {details}{extra}', self._log_elapsed())
             elif status == 'failed':
                 self._append_activity('error',
-                    f'Failed to analyze {self._jobs[index].label} · see Raw output', self._log_elapsed())
+                    f'Failed to analyze {job.label} · See the scan status for details', self._log_elapsed())
             elif status == 'cancelled':
                 self._append_activity('warning',
-                    f'Cancelled {self._jobs[index].label}', self._log_elapsed())
-            for item in row['tracks'].values():
-                item['row'].remove_css_class('mg-active-track')
-            done = sum(x['status'].get_text() in ('Completed', 'Failed', 'Cancelled') for x in self._rows)
-            self._scan_completed_albums = done
-            self.progress.set_fraction(done / len(self._rows))
-            self.progress.set_text(f'{done}/{len(self._rows)} albums')
+                    f'Cancelled {job.label}', self._log_elapsed())
+            if row:
+                for item in row['tracks'].values():
+                    item['row'].remove_css_class('mg-active-track')
+            self._scan_completed_albums = sum(
+                self._job_status.get(scanned.folder) in ('success', 'failed', 'cancelled')
+                for scanned in self._scan_jobs)
+            self.progress.set_fraction(self._scan_completed_albums / len(self._scan_jobs))
+            self.progress.set_text(f'{self._scan_completed_albums}/{len(self._scan_jobs)} albums')
         return GLib.SOURCE_REMOVE
 
     def _on_finished(self, success: int, errors: int, cancelled: bool):
         elapsed_final = self._log_elapsed()
         self._scan_started_at = None
-        self.activity_spinner.stop()
-        self.activity_timer_label.set_text(f'{format_elapsed(elapsed_final or 0)} total')
         self._scan_active_album = None
         if self._scan_progress_timer is not None:
             GLib.source_remove(self._scan_progress_timer)
             self._scan_progress_timer = None
         self.config_box.set_sensitive(True)
         for control in (self.album_switch, self.true_peak_switch, self.write_switch, self.skip_switch,
-                        self.theme_choice, self.notify_switch, self.clip_choice,
-                        self.backend_entry, self.backend_row):
+                        self.theme_choice, self.notify_switch, self.clip_choice):
             control.set_sensitive(True)
         self._set_import_sensitive(True)
         self.cancel_button.set_sensitive(False)
-        self.run_button.set_sensitive(bool(self._jobs) and bool(self.backend.path))
+        self._update_selection_ui()
         if cancelled:
             message = f'Scan cancelled · {self._plural(success, "album")} completed, {errors} failed'
-            finished = sum(x['status'].get_text() in ('Completed', 'Failed', 'Cancelled') for x in self._rows)
-            if self._rows:
-                self.progress.set_fraction(finished / len(self._rows))
+            finished = sum(
+                self._job_status.get(scanned.folder) in ('success', 'failed', 'cancelled')
+                for scanned in self._scan_jobs)
+            if self._scan_jobs:
+                self.progress.set_fraction(finished / len(self._scan_jobs))
         else:
             message = f'Scan finished · {self._plural(success, "album")} completed, {errors} failed'
             self.progress.set_fraction(1)
             self.progress.set_text('Scan finished')
+        if elapsed_final is not None:
+            message += f' · {format_elapsed(elapsed_final)}'
         self.status_label.set_text(message)
+        self.status_label.set_tooltip_text('One or more albums could not be analyzed.' if errors else None)
         self._append_activity('warning' if cancelled else ('error' if errors else 'success'),
                               message, elapsed_final)
         self._append_log(f'\n{message}\n')
-        self._scan_view_active = False
+        # Expose measured values immediately after the scan. Open at most two
+        # visible albums to preserve responsiveness with large imported queues.
+        self._reveal_completed_results()
         if self._scan_wrote_tags:
             self._reload_existing_tags()
         if self.notify_switch.get_active():
@@ -1104,6 +1377,20 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
                 self._append_log(f'Notification unavailable: {exc}\n')
         return GLib.SOURCE_REMOVE
 
+    def _reveal_completed_results(self):
+        """Reveal the last analyzed album without rebuilding or jumping pages.
+
+        User-initiated scrolling, search and pagination suspend auto-follow.
+        Never automatically expand an unrelated album above their viewport.
+        """
+        if not self._follow_scan or self._last_active_folder is None:
+            return
+        row = self._visible_rows.get(self._last_active_folder)
+        result = self._results.get(self._last_active_folder, {})
+        if row is not None and (result.get('tracks') or result.get('album')):
+            row['toggle'].set_active(True)
+            GLib.idle_add(self._scroll_to_active_album, self._last_active_folder)
+
     def _refresh_tags(self, *_args):
         """Manually reload tags, without running rsgain or writing audio."""
         if self._runner.running or self._busy or not self._files:
@@ -1111,6 +1398,7 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self._busy = True
         self._set_import_sensitive(False)
         self.run_button.set_sensitive(False)
+        self.scan_all_button.set_sensitive(False)
         self.status_label.set_text('Reading existing ReplayGain tags…')
         self._reload_existing_tags(manual=True)
 
@@ -1134,22 +1422,30 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
             # measurements from a prior scan that might now be stale.
             self._results.clear()
         for row in self._rows:
+            self._update_expander_caption(row)
             self._apply_metrics(row, self._results.get(row['folder'], {}))
-            if manual:
-                self._tag_status(row)
+            self._tag_status(row)
         tagged = sum(1 for path in self._files
                      if self._existing_tags.get(path, TagRead()).info.tagged)
         unknown = sum(1 for path in self._files
                       if self._existing_tags.get(path, TagRead()).error)
         self._append_log(f'Existing gain tags found in {tagged}/{len(self._files)} tracks'
                          f' ({unknown} unreadable).\n')
+        if manual and self.tags_filter.get_selected():
+            self._apply_album_filter()
         if manual:
             self._busy = False
             self._set_import_sensitive(True)
-            self.run_button.set_sensitive(bool(self._jobs) and bool(self.backend.path))
+            self._update_selection_ui()
             self.status_label.set_text(f'{tagged} tracks with existing gain tags · '
                                        f'{unknown} unreadable')
         return GLib.SOURCE_REMOVE
+
+    def _cancel_current(self, *_args):
+        if self._busy:
+            self._cancel_import()
+        elif self._scan_started_at is not None:
+            self._cancel()
 
     def _cancel(self, *_args):
         self._scan_cancel_requested = True
@@ -1160,62 +1456,66 @@ class MonkeyGainWindow(Gtk.ApplicationWindow):
         self.cancel_button.set_sensitive(False)
 
     def _append_log(self, message: str):
-        """Keep full unmodified backend output, but display friendly live events."""
+        """Retain engine output internally for troubleshooting and tests."""
         self._activity_journal.add_raw(message)
-        if self.raw_log_toggle.get_active():
-            self._insert_log_text(message)
-        elif not self._scan_view_active:
-            # Diagnostics before and after scans should never disappear.
-            if message.strip():
-                self._append_activity('info', message.rstrip('\n'), None)
-        elif ('error:' in message.lower() or 'failed to ' in message.lower()):
-            # Show unexpected scanner errors right away, preserving the raw log.
-            self._append_activity('error', message.strip(), self._log_elapsed())
         return GLib.SOURCE_REMOVE
-
-    def _export_log(self, *_args):
-        dialog = Gtk.FileDialog()
-        dialog.set_title('Save Analysis Log')
-        dialog.set_initial_name('monkeygain-log.txt')
-        dialog.save(self, None, self._on_log_saved)
-
-    def _on_log_saved(self, dialog, result):
-        try:
-            file = dialog.save_finish(result)
-            path = file.get_path()
-            if not path:
-                raise OSError('Choose a local destination.')
-            # Always export all diagnostics, even while the Activity view is selected.
-            Path(path).write_text(self._activity_journal.raw_text(), encoding='utf-8')
-            self.status_label.set_text('Log exported successfully')
-        except GLib.Error:
-            return
-        except OSError as exc:
-            self._append_log(f'Could not export log: {exc}\n')
 
     def _on_close(self, *_args):
         if self._runner.running:
             self._runner.cancel()
+        if self._import_runner.running:
+            self._import_runner.cancel()
         return False
 
 
 class MonkeyGain(Gtk.Application):
+    """Keep the main workspace hidden until runtime requirements are available."""
+
     def __init__(self):
         super().__init__(application_id=APP_ID,
                          flags=Gio.ApplicationFlags.HANDLES_OPEN)
+        self._runtime_status = None
+        self._dependency_window = None
+
+    def _show_dependency_error(self, message: str):
+        window = Gtk.ApplicationWindow(application=self, title='MonkeyGain')
+        window.set_default_size(490, 220)
+        window.set_resizable(False)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        box.set_margin_top(26)
+        box.set_margin_bottom(26)
+        box.set_margin_start(26)
+        box.set_margin_end(26)
+        heading = label('MonkeyGain could not start', 'mg-title', wrap=True)
+        box.append(heading)
+        box.append(label(message, 'mg-description', wrap=True))
+        close = Gtk.Button(label='Close')
+        close.set_halign(Gtk.Align.END)
+        close.connect('clicked', lambda *_: window.close())
+        box.append(close)
+        window.set_child(box)
+        self._dependency_window = window
+        window.present()
 
     def do_activate(self):
         window = self.props.active_window
-        if not window:
-            window = MonkeyGainWindow(self)
+        if window:
+            window.present()
+            return
+        if self._runtime_status is None:
+            self._runtime_status = check_runtime()
+        if not self._runtime_status.ready:
+            self._show_dependency_error(self._runtime_status.message)
+            return
+        window = MonkeyGainWindow(self, self._runtime_status.backend)
         window.present()
 
     def do_open(self, files, n_files, hint):
         self.do_activate()
         window = self.props.active_window
-        if window:
+        if isinstance(window, MonkeyGainWindow):
             window._discover([f.get_path() for f in files if f.get_path()])
 
 
 def main() -> int:
-    return MonkeyGain().run(None)
+    return MonkeyGain().run(sys.argv)

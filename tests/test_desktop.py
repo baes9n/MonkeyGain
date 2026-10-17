@@ -8,7 +8,7 @@ import unittest
 
 from monkeygain.desktop import (
     APP_ID, DesktopPaths, desktop_contents, desktop_quote,
-    destination_paths, install, launcher_contents, uninstall,
+    destination_paths, install, launcher_contents, uninstall, installed_icons, ICON_SIZES, old_svg_icon,
 )
 
 
@@ -19,7 +19,7 @@ class TestDesktop(unittest.TestCase):
             files = destination_paths(root, root / 'share')
             self.assertEqual(files.launcher, root / '.local/bin/monkeygain')
             self.assertEqual(files.entry.name, f'{APP_ID}.desktop')
-            self.assertEqual(files.icon.name, f'{APP_ID}.svg')
+            self.assertEqual(files.icon.name, f'{APP_ID}.png')
             self.assertEqual(APP_ID, 'io.github.baes9n.MonkeyGain')
 
     def test_launcher_preserves_arguments_and_spaces(self):
@@ -49,7 +49,9 @@ class TestDesktop(unittest.TestCase):
             project = root / 'Git Source'
             (project / 'assets').mkdir(parents=True)
             (project / 'run.py').write_text('# the real application\n')
-            (project / 'assets/monkeygain.svg').write_text('<svg/>')
+            (project / 'assets/icons').mkdir(parents=True)
+            for size in ICON_SIZES:
+                (project / 'assets/icons' / f'{size}.png').write_bytes(b'PNG_IMAGE')
             (project / '.git').mkdir()
             user = root / 'home'
             files = destination_paths(user, user / '.local/share')
@@ -57,10 +59,11 @@ class TestDesktop(unittest.TestCase):
             self.assertTrue(files.launcher.is_file())
             self.assertEqual(files.launcher.stat().st_mode & 0o777, 0o755)
             self.assertTrue(files.entry.is_file())
-            self.assertEqual(files.icon.read_text(), '<svg/>')
+            self.assertEqual(files.icon.read_bytes(), b'PNG_IMAGE')
+            self.assertTrue(all(icon.is_file() for icon in installed_icons(files)))
             self.assertIn(str(project / 'run.py'), files.launcher.read_text())
             removed = uninstall(files)
-            self.assertEqual(set(removed), {files.entry, files.icon, files.launcher})
+            self.assertEqual(set(removed), {files.entry, *installed_icons(files), files.launcher})
             self.assertTrue((project / '.git').is_dir())
             self.assertTrue((project / 'run.py').is_file())
 

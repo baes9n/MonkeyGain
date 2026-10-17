@@ -1,0 +1,49 @@
+name: Linux tests and Debian package
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Test and build (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Install system test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-mutagen dpkg-dev
+
+      - name: Run headless unit tests
+        run: /usr/bin/python3 -m unittest discover -s tests -v
+
+      - name: Check Python syntax
+        run: /usr/bin/python3 -m compileall -q monkeygain scripts run.py
+
+      - name: Build Debian package
+        run: /usr/bin/python3 scripts/build_deb.py --output-dir dist
+
+      - name: Verify Debian package
+        run: |
+          VERSION=$(/usr/bin/python3 -c 'from monkeygain import __version__; print(__version__)')
+          /usr/bin/python3 scripts/verify_release.py "dist/monkeygain_${VERSION}_all.deb"
+          (cd dist && sha256sum monkeygain_*.deb > SHA256SUMS)
+
+      - name: Attach package to successful workflow run
+        uses: actions/upload-artifact@v4
+        with:
+          name: monkeygain-debian-${{ github.run_number }}
+          path: |
+            dist/monkeygain_*.deb
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30

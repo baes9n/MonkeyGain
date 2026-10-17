@@ -21,6 +21,14 @@ We target Python 3.12+, GTK 4, and rsgain 3.4 or newer. Linux packages supply Py
 
 7. Test the GTK interface on a Linux desktop, in both light and dark modes. Use disposable audio copies for any tag-writing tests.
 
+## Continuous integration
+
+Each pull request is validated by the GitHub Actions Linux test and packaging
+workflow. For changes to Debian packaging, run
+`python3 scripts/verify_release.py dist/monkeygain_0.5.5_all.deb` after
+building locally. See [docs/RELEASING.md](docs/RELEASING.md) before creating
+a release tag or uploading binary packages.
+
 ## Reporting issues
 
 Include your distribution, Python / GTK / rsgain versions, steps to reproduce, and relevant log output. **Remove private file paths and other personal information** before sharing logs publicly.
