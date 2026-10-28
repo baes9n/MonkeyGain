@@ -41,50 +41,32 @@ class FakeWidget:
 
 
 class AlbumMotionTests(unittest.TestCase):
-    def test_disclosure_uses_no_height_animation_or_focus_stealing(self):
+    def test_disclosure_matches_stable_list_behavior(self):
         code = section('_make_album_row')
-        self.assertIn('toggle.set_focus_on_click(False)', code)
-        self.assertIn('Gtk.RevealerTransitionType.NONE', code)
-        self.assertIn('revealer.set_transition_duration(0)', code)
-        self.assertNotIn('Gtk.RevealerTransitionType.SLIDE_DOWN', code)
-        self.assertNotIn('_finish_album_expand', code)
+        self.assertIn('Gtk.Revealer()', code)
+        self.assertIn('Gtk.RevealerTransitionType.SLIDE_DOWN', code)
+        self.assertIn('revealer.set_transition_duration(160)', code)
+        self.assertIn('revealer.set_reveal_child(active)', code)
+        self.assertIn('self._expanded_albums[job.folder] = active', code)
 
-    def test_collapse_saves_and_restores_original_viewport(self):
+    def test_collapse_does_not_schedule_scroll_restoration(self):
         code = section('_make_album_row')
-        self.assertIn("row['scroll_before_open'] = self.album_scroller.get_vadjustment().get_value()", code)
-        self.assertIn('GLib.idle_add(self._restore_closed_album_scroll, row, previous)', code)
-        self.assertIn('GLib.timeout_add(40, self._restore_closed_album_scroll, row, previous)', code)
+        self.assertNotIn('GLib.timeout_add(40, self._restore_closed_album_scroll', code)
+        self.assertNotIn('GLib.idle_add(self._restore_closed_album_scroll', code)
+        self.assertIn('revealer.set_reveal_child(active)', code)
 
-    def test_delayed_restoration_ignores_removed_or_reopened_row(self):
-        callback = isolated('_restore_closed_album_scroll',
-                            {'GLib': types.SimpleNamespace(SOURCE_REMOVE=0)})
-        row = {'folder': '/music/album',
-               'toggle': types.SimpleNamespace(get_active=lambda: False)}
-        self_obj = types.SimpleNamespace(_visible_rows={'/music/album': row},
-                                         _restore_album_scroll=Mock())
-        self.assertEqual(callback(self_obj, row, 250.0), 0)
-        self_obj._restore_album_scroll.assert_called_once_with(250.0)
-        self_obj._restore_album_scroll.reset_mock()
-        row['toggle'] = types.SimpleNamespace(get_active=lambda: True)
-        callback(self_obj, row, 250.0)
-        self_obj._restore_album_scroll.assert_not_called()
-        row['toggle'] = types.SimpleNamespace(get_active=lambda: False)
-        self_obj._visible_rows = {}
-        callback(self_obj, row, 250.0)
-        self_obj._restore_album_scroll.assert_not_called()
+    def test_no_obsolete_delayed_restoration_method(self):
+        methods = {node.name for node in WINDOW.body if isinstance(node, ast.FunctionDef)}
+        self.assertNotIn('_restore_closed_album_scroll', methods)
+        self.assertNotIn('_finish_album_expand', methods)
 
-    def test_selection_has_theme_independent_row_and_badge(self):
+    def test_selection_highlights_the_album_row(self):
         setter = isolated('_style_album_selection')
-        row = {'widget': FakeWidget(), 'header': FakeWidget(),
-               'selected_label': FakeWidget()}
+        row = {'widget': FakeWidget(), 'header': FakeWidget()}
         setter(row, True)
         self.assertIn('mg-selected-album', row['widget'].classes)
-        self.assertIn('mg-selected-album', row['header'].classes)
-        self.assertTrue(row['selected_label'].visible)
         setter(row, False)
         self.assertNotIn('mg-selected-album', row['widget'].classes)
-        self.assertNotIn('mg-selected-album', row['header'].classes)
-        self.assertFalse(row['selected_label'].visible)
 
     def test_selection_is_restored_when_paging(self):
         code = section('_make_album_row')
@@ -94,12 +76,12 @@ class AlbumMotionTests(unittest.TestCase):
         self.assertIn('self._style_album_selection(row, True)', section('_select_matches'))
         self.assertIn('self._style_album_selection(row, False)', section('_clear_selection'))
 
-    def test_theme_contrast_and_expanded_visual_cues(self):
+    def test_theme_contrast_and_selected_visual_cues(self):
         for needle in ('.mg-dark row.mg-album-row.mg-selected-album',
                        '.mg-light row.mg-album-row.mg-selected-album',
-                       '.mg-selected-badge',
                        'inset 4px 0',
-                       'mg-expanded-album:not(.mg-selected-album)'):
+                       '.mg-dark .mg-album-checkbox check:checked',
+                       '.mg-light .mg-album-checkbox check:checked'):
             self.assertIn(needle, CSS)
 
 

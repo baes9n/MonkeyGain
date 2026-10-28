@@ -57,10 +57,10 @@ class UIRefinementTests(unittest.TestCase):
         section = method_text('_make_album_row')
         self.assertIn('Gtk.CheckButton()', section)
         self.assertIn("Gtk.Image.new_from_icon_name('view-list-symbolic')", section)
-        self.assertNotIn("'media-optical-symbolic'", section)
         self.assertIn('header.append(titles)', section)
         self.assertIn('header.append(toggle)', section)
-        self.assertIn('item.set_focusable(True)', section)
+        self.assertIn('self._style_album_selection(row, job.folder in self._selection.selected)', section)
+        self.assertIn('self._update_expander_caption(row)', section)
 
     def test_keyboard_shortcuts_act_only_when_available(self):
         handler = isolated_method('_on_key_pressed', {'Gdk': FakeGdk})
